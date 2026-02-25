@@ -62,6 +62,7 @@ type Pattern interface {
 type MatchContext struct {
 	Namespaces map[string]string
 	XPathEval  func(expr string, node goxml.XMLNode) (bool, error)
+	KeyLookup  func(keyName, valueExpr string, ns map[string]string) []goxml.XMLNode
 }
 
 // --------------------------------------------------------------------------

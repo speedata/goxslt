@@ -96,6 +96,16 @@ func parseSequenceType(s string) (*SequenceType, error) {
 	return st, nil
 }
 
+// atomicZeroValue returns the zero value for string types.
+// Only xs:string gets a zero value ("") since empty output from xsl:value-of
+// is a common pattern in XSLT stylesheets with as="xs:string" functions.
+func atomicZeroValue(typ ItemType) (any, bool) {
+	if typ == ItemTypeString {
+		return "", true
+	}
+	return nil, false
+}
+
 // coerceSequence validates and coerces a sequence to match the declared type.
 // It returns the coerced sequence or an error if the value cannot be converted.
 func coerceSequence(st *SequenceType, seq goxpath.Sequence) (goxpath.Sequence, error) {
@@ -103,6 +113,15 @@ func coerceSequence(st *SequenceType, seq goxpath.Sequence) (goxpath.Sequence, e
 	n := len(seq)
 	switch st.Cardinality {
 	case CardOne:
+		if n == 0 {
+			// For atomic types, supply the zero value instead of erroring.
+			// This matches common XSLT stylesheet patterns where a function
+			// body may produce no output (e.g. xsl:value-of with empty select).
+			if zv, ok := atomicZeroValue(st.Item); ok {
+				return goxpath.Sequence{zv}, nil
+			}
+			return nil, fmt.Errorf("expected exactly 1 item, got 0")
+		}
 		if n != 1 {
 			return nil, fmt.Errorf("expected exactly 1 item, got %d", n)
 		}

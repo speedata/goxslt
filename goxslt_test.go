@@ -2224,6 +2224,215 @@ func TestForEachGroupEmpty(t *testing.T) {
 	}
 }
 
+func TestForEachGroupCurrentGroupChildPredicate(t *testing.T) {
+	result := runXSLT(t,
+		`<MeDaPro>
+  <Row>
+    <Artikelklasse_ID><![CDATA[ID1]]></Artikelklasse_ID>
+    <InvariantAttributeName1>Attr1</InvariantAttributeName1>
+    <InvariantAttributeValue1>Val1</InvariantAttributeValue1>
+    <InvariantAttributeUnit1>mm</InvariantAttributeUnit1>
+    <Pikto1 Name="Pikto1" />
+    <Pikto2 Name="Pikto2"><![CDATA[\_img\VDE.png]]></Pikto2>
+    <Pikto3 Name="Pikto3"><![CDATA[\_img\EAC.png]]></Pikto3>
+    <Pikto4 Name="Pikto4" />
+  </Row>
+  <Row>
+    <Artikelklasse_ID><![CDATA[ID1]]></Artikelklasse_ID>
+    <InvariantAttributeName1>Attr1</InvariantAttributeName1>
+    <InvariantAttributeValue1>Val2</InvariantAttributeValue1>
+    <InvariantAttributeUnit1>mm</InvariantAttributeUnit1>
+    <Pikto1 Name="Pikto1" />
+    <Pikto2 Name="Pikto2"><![CDATA[\_img\VDE.png]]></Pikto2>
+    <Pikto3 Name="Pikto3" />
+    <Pikto4 Name="Pikto4" />
+  </Row>
+</MeDaPro>`,
+		`<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+  <xsl:template match="*[starts-with(local-name(), 'Pikto')]">
+    <piktogramm datei="{.}"/>
+  </xsl:template>
+  <xsl:template match="MeDaPro">
+    <result>
+      <xsl:for-each-group select="Row" group-by="Artikelklasse_ID">
+        <xsl:variable name="row" select="."/>
+        <xsl:variable name="l" select="string-length('InvariantAttributeName') + 1"/>
+        <group key="{current-grouping-key()}">
+          <!-- Loop like the real stylesheet: for $i in *[starts-with(...)]/local-name() -->
+          <tab>
+            <xsl:for-each select="
+                for $i in *[starts-with(local-name(), 'InvariantAttributeName')]/local-name()
+                return replace($i, '[a-zA-Z]', '')">
+              <xsl:variable name="c" select="."/>
+              <xsl:variable name="eltname" select="concat('InvariantAttributeName', $c)"/>
+              <xsl:variable name="eltvalue" select="concat('InvariantAttributeValue', $c)"/>
+              <xsl:variable name="name" select="$row/*[local-name() = $eltname]"/>
+              <xsl:variable name="value" select="$row/*[local-name() = $eltvalue]"/>
+              <xsl:if test="string-length($name) > 0">
+                <attr name="{$name}" value="{$value}"/>
+              </xsl:if>
+            </xsl:for-each>
+          </tab>
+          <!-- Now the piktogramme variable -->
+          <xsl:variable name="piktos">
+            <xsl:apply-templates select="current-group()/*[starts-with(local-name(), 'Pikto') and string-length(.) > 0]"/>
+          </xsl:variable>
+          <piktogramme><xsl:copy-of select="$piktos"/></piktogramme>
+        </group>
+      </xsl:for-each-group>
+    </result>
+  </xsl:template>
+</xsl:stylesheet>`)
+	t.Logf("Result: %s", result)
+	if !strings.Contains(result, `datei="\_img\VDE.png"`) {
+		t.Errorf("expected piktogramm with VDE.png, got %s", result)
+	}
+	if !strings.Contains(result, `datei="\_img\EAC.png"`) {
+		t.Errorf("expected piktogramm with EAC.png, got %s", result)
+	}
+}
+
+func TestRealFlexaStylesheet(t *testing.T) {
+	xmlFile := "/Users/patrick/work/projekte/2025/2025-03/Arbeitsverzeichnis/rohdaten.xml"
+	xsltFile := "/Users/patrick/work/projekte/2025/2025-03/Arbeitsverzeichnis/flexa2data.xslt"
+
+	// Change to the working directory so relative doc() calls work
+	origDir, _ := os.Getwd()
+	os.Chdir("/Users/patrick/work/projekte/2025/2025-03/Arbeitsverzeichnis")
+	defer os.Chdir(origDir)
+
+	xmlReader, err := os.Open(xmlFile)
+	if err != nil {
+		t.Skip("real data not available:", err)
+	}
+	defer xmlReader.Close()
+
+	xsltReader, err := os.Open(xsltFile)
+	if err != nil {
+		t.Skip("real stylesheet not available:", err)
+	}
+	defer xsltReader.Close()
+
+	sourceDoc, err := goxml.Parse(xmlReader)
+	if err != nil {
+		t.Fatal("parsing XML:", err)
+	}
+	xsltDoc, err := goxml.Parse(xsltReader)
+	if err != nil {
+		t.Fatal("parsing XSLT:", err)
+	}
+	ss, err := Compile(xsltDoc)
+	if err != nil {
+		t.Fatal("compiling:", err)
+	}
+
+	var messages []string
+	opts := TransformOptions{
+		MessageHandler: func(text string, terminate bool) {
+			messages = append(messages, text)
+		},
+	}
+	result, err := TransformWithOptions(ss, sourceDoc, opts)
+	if err != nil {
+		t.Fatal("transforming:", err)
+	}
+	for _, msg := range messages {
+		t.Logf("XSLT message: %s", msg)
+	}
+	// Check the secondary document (output.xml from result-document).
+	for href, doc := range result.SecondaryDocuments {
+		output := doc.ToXML()
+		t.Logf("Secondary %s (len=%d): %s", href, len(output), output[:min(len(output), 500)])
+		// Dump the eigenschaften section for debugging.
+		if idx := strings.Index(output, "<eigenschaften>"); idx >= 0 {
+			end := strings.Index(output[idx:], "</eigenschaften>")
+			if end > 0 {
+				t.Logf("eigenschaften section: %s", output[idx:idx+end+len("</eigenschaften>")])
+			}
+		}
+		if strings.Contains(output, "<eigenschaften />") || strings.Contains(output, "<eigenschaften/>") {
+			t.Log("eigenschaften is EMPTY")
+		}
+		if href == "output.xml" && strings.Contains(output, "<piktogramme />") {
+			t.Error("piktogramme is empty — $variable/child path not working")
+		}
+		if href == "output.xml" && strings.Contains(output, "<piktogramme>") {
+			t.Log("piktogramme has content — fix works!")
+		}
+	}
+}
+
+// ========== Variable with body content is a document node ==========
+
+func TestVariableBodyIsDocumentNode(t *testing.T) {
+	xmlData := `<root><a>1</a><b>2</b><c>3</c></root>`
+	xslt := `<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+  <xsl:template match="/">
+    <xsl:variable name="items">
+      <xsl:for-each select="root/*">
+        <item val="{.}"/>
+      </xsl:for-each>
+    </xsl:variable>
+    <out count="{count($items/item)}">
+      <xsl:for-each select="$items/item">
+        <v><xsl:value-of select="@val"/></v>
+      </xsl:for-each>
+    </out>
+  </xsl:template>
+</xsl:stylesheet>`
+	result := runXSLT(t, xmlData, xslt)
+	t.Log("Result:", result)
+	if !strings.Contains(result, `count="3"`) {
+		t.Error("expected count=3, got:", result)
+	}
+	if !strings.Contains(result, "<v>1</v><v>2</v><v>3</v>") {
+		t.Error("expected <v>1</v><v>2</v><v>3</v>, got:", result)
+	}
+}
+
+func TestVariableBodyStringValue(t *testing.T) {
+	xmlData := `<root/>`
+	xslt := `<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+  <xsl:template match="/">
+    <xsl:variable name="msg">hello world</xsl:variable>
+    <out><xsl:value-of select="$msg"/></out>
+  </xsl:template>
+</xsl:stylesheet>`
+	result := runXSLT(t, xmlData, xslt)
+	t.Log("Result:", result)
+	if !strings.Contains(result, "hello world") {
+		t.Error("expected 'hello world', got:", result)
+	}
+}
+
+func TestVariableBodyDocNodePathAndSome(t *testing.T) {
+	xmlData := `<root><a val="x"/><b val=""/><c val="y"/></root>`
+	xslt := `<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+  <xsl:template match="/">
+    <xsl:variable name="data">
+      <container>
+        <xsl:for-each select="root/*">
+          <item attr="{@val}"/>
+        </xsl:for-each>
+      </container>
+    </xsl:variable>
+    <xsl:variable name="hasNonEmpty" select="
+        some $i in $data/container/item/@attr
+          satisfies normalize-space($i) != ''"/>
+    <xsl:variable name="count" select="count($data/container/item/@attr)"/>
+    <out has="{$hasNonEmpty}" count="{$count}"/>
+  </xsl:template>
+</xsl:stylesheet>`
+	result := runXSLT(t, xmlData, xslt)
+	t.Log("Result:", result)
+	if !strings.Contains(result, `has="true"`) {
+		t.Error("expected has=true, got:", result)
+	}
+	if !strings.Contains(result, `count="3"`) {
+		t.Error("expected count=3, got:", result)
+	}
+}
+
 // ========== xsl:result-document ==========
 
 func TestResultDocumentBasic(t *testing.T) {
@@ -2335,5 +2544,247 @@ func TestResultDocumentMultiple(t *testing.T) {
 	t.Logf("2.xml: %s", s2)
 	if !strings.Contains(s2, "<book-detail>XML</book-detail>") {
 		t.Errorf("expected <book-detail>XML</book-detail> in 2.xml, got %s", s2)
+	}
+}
+
+// ========== xsl:analyze-string ==========
+
+func TestAnalyzeStringBasic(t *testing.T) {
+	result := runXSLT(t,
+		`<root>one 42 two 99 three</root>`,
+		`<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+  <xsl:template match="/">
+    <out>
+      <xsl:analyze-string select="root" regex="\d+">
+        <xsl:matching-substring>
+          <m><xsl:value-of select="."/></m>
+        </xsl:matching-substring>
+        <xsl:non-matching-substring>
+          <n><xsl:value-of select="."/></n>
+        </xsl:non-matching-substring>
+      </xsl:analyze-string>
+    </out>
+  </xsl:template>
+</xsl:stylesheet>`)
+	if !strings.Contains(result, "<m>42</m>") {
+		t.Errorf("expected <m>42</m>, got %s", result)
+	}
+	if !strings.Contains(result, "<m>99</m>") {
+		t.Errorf("expected <m>99</m>, got %s", result)
+	}
+	if !strings.Contains(result, "<n>one </n>") {
+		t.Errorf("expected <n>one </n>, got %s", result)
+	}
+	if !strings.Contains(result, "<n> two </n>") {
+		t.Errorf("expected <n> two </n>, got %s", result)
+	}
+	if !strings.Contains(result, "<n> three</n>") {
+		t.Errorf("expected <n> three</n>, got %s", result)
+	}
+}
+
+func TestAnalyzeStringRegexGroup(t *testing.T) {
+	result := runXSLT(t,
+		`<root>2024-01-15 and 2025-12-31</root>`,
+		`<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+  <xsl:template match="/">
+    <out>
+      <xsl:analyze-string select="root" regex="(\d{{4}})-(\d{{2}})-(\d{{2}})">
+        <xsl:matching-substring>
+          <date y="{regex-group(1)}" m="{regex-group(2)}" d="{regex-group(3)}"/>
+        </xsl:matching-substring>
+      </xsl:analyze-string>
+    </out>
+  </xsl:template>
+</xsl:stylesheet>`)
+	if !strings.Contains(result, `y="2024"`) {
+		t.Errorf("expected y='2024', got %s", result)
+	}
+	if !strings.Contains(result, `m="01"`) {
+		t.Errorf("expected m='01', got %s", result)
+	}
+	if !strings.Contains(result, `d="15"`) {
+		t.Errorf("expected d='15', got %s", result)
+	}
+	if !strings.Contains(result, `y="2025"`) {
+		t.Errorf("expected y='2025', got %s", result)
+	}
+	if !strings.Contains(result, `m="12"`) {
+		t.Errorf("expected m='12', got %s", result)
+	}
+	if !strings.Contains(result, `d="31"`) {
+		t.Errorf("expected d='31', got %s", result)
+	}
+}
+
+func TestAnalyzeStringFullMatch(t *testing.T) {
+	result := runXSLT(t,
+		`<root>12345</root>`,
+		`<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+  <xsl:template match="/">
+    <out>
+      <xsl:analyze-string select="root" regex="\d+">
+        <xsl:matching-substring>
+          <m><xsl:value-of select="."/></m>
+        </xsl:matching-substring>
+        <xsl:non-matching-substring>
+          <n><xsl:value-of select="."/></n>
+        </xsl:non-matching-substring>
+      </xsl:analyze-string>
+    </out>
+  </xsl:template>
+</xsl:stylesheet>`)
+	if !strings.Contains(result, "<m>12345</m>") {
+		t.Errorf("expected <m>12345</m>, got %s", result)
+	}
+	if strings.Contains(result, "<n>") {
+		t.Errorf("expected no <n> elements for full match, got %s", result)
+	}
+}
+
+func TestAnalyzeStringNoMatch(t *testing.T) {
+	result := runXSLT(t,
+		`<root>hello world</root>`,
+		`<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+  <xsl:template match="/">
+    <out>
+      <xsl:analyze-string select="root" regex="\d+">
+        <xsl:matching-substring>
+          <m><xsl:value-of select="."/></m>
+        </xsl:matching-substring>
+        <xsl:non-matching-substring>
+          <n><xsl:value-of select="."/></n>
+        </xsl:non-matching-substring>
+      </xsl:analyze-string>
+    </out>
+  </xsl:template>
+</xsl:stylesheet>`)
+	if strings.Contains(result, "<m>") {
+		t.Errorf("expected no <m> elements when nothing matches, got %s", result)
+	}
+	if !strings.Contains(result, "<n>hello world</n>") {
+		t.Errorf("expected <n>hello world</n>, got %s", result)
+	}
+}
+
+// ========== xsl:key and key() ==========
+
+func TestKeyBasic(t *testing.T) {
+	result := runXSLT(t,
+		`<data><item id="x">Alpha</item><item id="y">Beta</item></data>`,
+		`<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+  <xsl:key name="idx" match="item" use="@id"/>
+  <xsl:template match="/">
+    <out><xsl:value-of select="key('idx','x')"/></out>
+  </xsl:template>
+</xsl:stylesheet>`)
+	if !strings.Contains(result, "<out>Alpha</out>") {
+		t.Errorf("expected <out>Alpha</out>, got %s", result)
+	}
+}
+
+func TestKeyMultipleMatches(t *testing.T) {
+	result := runXSLT(t,
+		`<data><item cat="a">One</item><item cat="b">Two</item><item cat="a">Three</item></data>`,
+		`<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+  <xsl:key name="byCat" match="item" use="@cat"/>
+  <xsl:template match="/">
+    <out><xsl:for-each select="key('byCat','a')"><v><xsl:value-of select="."/></v></xsl:for-each></out>
+  </xsl:template>
+</xsl:stylesheet>`)
+	if !strings.Contains(result, "<v>One</v>") {
+		t.Errorf("expected <v>One</v>, got %s", result)
+	}
+	if !strings.Contains(result, "<v>Three</v>") {
+		t.Errorf("expected <v>Three</v>, got %s", result)
+	}
+}
+
+func TestKeyNoMatch(t *testing.T) {
+	result := runXSLT(t,
+		`<data><item id="x">Alpha</item></data>`,
+		`<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+  <xsl:key name="idx" match="item" use="@id"/>
+  <xsl:template match="/">
+    <out><xsl:value-of select="count(key('idx','missing'))"/></out>
+  </xsl:template>
+</xsl:stylesheet>`)
+	if !strings.Contains(result, "<out>0</out>") {
+		t.Errorf("expected <out>0</out>, got %s", result)
+	}
+}
+
+func TestKeyInForEach(t *testing.T) {
+	result := runXSLT(t,
+		`<data>
+  <item id="1" ref="a"/>
+  <item id="2" ref="b"/>
+  <lookup code="a" val="Apple"/>
+  <lookup code="b" val="Banana"/>
+</data>`,
+		`<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+  <xsl:key name="lu" match="lookup" use="@code"/>
+  <xsl:template match="/">
+    <out><xsl:for-each select="data/item"><r><xsl:value-of select="key('lu',@ref)/@val"/></r></xsl:for-each></out>
+  </xsl:template>
+</xsl:stylesheet>`)
+	if !strings.Contains(result, "<r>Apple</r>") {
+		t.Errorf("expected <r>Apple</r>, got %s", result)
+	}
+	if !strings.Contains(result, "<r>Banana</r>") {
+		t.Errorf("expected <r>Banana</r>, got %s", result)
+	}
+}
+
+func TestKeyMultipleKeys(t *testing.T) {
+	result := runXSLT(t,
+		`<data><item id="x" cat="a">Alpha</item><item id="y" cat="b">Beta</item></data>`,
+		`<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+  <xsl:key name="byId" match="item" use="@id"/>
+  <xsl:key name="byCat" match="item" use="@cat"/>
+  <xsl:template match="/">
+    <out>
+      <id><xsl:value-of select="key('byId','y')"/></id>
+      <cat><xsl:value-of select="key('byCat','a')"/></cat>
+    </out>
+  </xsl:template>
+</xsl:stylesheet>`)
+	if !strings.Contains(result, "<id>Beta</id>") {
+		t.Errorf("expected <id>Beta</id>, got %s", result)
+	}
+	if !strings.Contains(result, "<cat>Alpha</cat>") {
+		t.Errorf("expected <cat>Alpha</cat>, got %s", result)
+	}
+}
+
+func TestKeyWithPath(t *testing.T) {
+	result := runXSLT(t,
+		`<data><item><name>Foo</name><val>100</val></item><item><name>Bar</name><val>200</val></item></data>`,
+		`<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+  <xsl:key name="byName" match="item" use="name"/>
+  <xsl:template match="/">
+    <out><xsl:value-of select="key('byName','Bar')/val"/></out>
+  </xsl:template>
+</xsl:stylesheet>`)
+	if !strings.Contains(result, "<out>200</out>") {
+		t.Errorf("expected <out>200</out>, got %s", result)
+	}
+}
+
+func TestKeyUsedInPredicate(t *testing.T) {
+	result := runXSLT(t,
+		`<data>
+  <item id="1"><title>First</title></item>
+  <item id="2"><title>Second</title></item>
+  <ref target="2"/>
+</data>`,
+		`<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+  <xsl:key name="items" match="item" use="@id"/>
+  <xsl:template match="/">
+    <out><xsl:for-each select="data/ref"><xsl:value-of select="key('items',@target)/title"/></xsl:for-each></out>
+  </xsl:template>
+</xsl:stylesheet>`)
+	if !strings.Contains(result, "<out>Second</out>") {
+		t.Errorf("expected <out>Second</out>, got %s", result)
 	}
 }

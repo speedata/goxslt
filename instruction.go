@@ -30,8 +30,9 @@ type AVT struct {
 
 // LiteralAttribute is an attribute on a literal result element.
 type LiteralAttribute struct {
-	Name  string
-	Value AVT
+	Name      string
+	Namespace string
+	Value     AVT
 }
 
 // LiteralText writes text to the result tree.
@@ -42,7 +43,8 @@ type LiteralText struct {
 // XSLValueOf evaluates an XPath expression and writes the string value to the
 // result tree. Corresponds to <xsl:value-of select="..."/>.
 type XSLValueOf struct {
-	Select string // XPath expression
+	Select    string // XPath expression
+	Separator string // item separator (default: single space in XSLT 2.0+)
 }
 
 // XSLApplyTemplates selects nodes via an XPath expression and applies
@@ -193,10 +195,11 @@ type XSLMapEntry struct {
 // XSLForEachGroup groups items and iterates over groups.
 // Corresponds to <xsl:for-each-group select="..." group-by="...">.
 type XSLForEachGroup struct {
-	Select   string        // XPath expression selecting the population
-	GroupBy  string        // XPath expression for grouping key
-	Sorts    []SortKey     // optional sort keys
-	Children []Instruction // body to execute per group
+	Select           string        // XPath expression selecting the population
+	GroupBy          string        // XPath expression for grouping key
+	GroupStartingPat Pattern       // compiled pattern for group-starting-with
+	Sorts            []SortKey     // optional sort keys
+	Children         []Instruction // body to execute per group
 }
 
 // XSLResultDocument redirects output to a secondary result document.
@@ -204,6 +207,25 @@ type XSLForEachGroup struct {
 type XSLResultDocument struct {
 	Href     AVT
 	Children []Instruction
+}
+
+// XSLAnalyzeString splits a string by a regular expression and processes
+// matching and non-matching substrings separately.
+// Corresponds to <xsl:analyze-string select="..." regex="...">.
+type XSLAnalyzeString struct {
+	Select      string        // XPath expression → input string
+	Regex       AVT           // AVT → regex pattern
+	Flags       AVT           // AVT → regex flags (optional)
+	Matching    []Instruction // body of xsl:matching-substring
+	NonMatching []Instruction // body of xsl:non-matching-substring
+}
+
+// KeyDefinition holds a compiled xsl:key declaration.
+type KeyDefinition struct {
+	Name      string  // key name (QName)
+	Match     Pattern // pattern for nodes to index
+	Use       string  // XPath expression for the key value
+	Composite bool    // composite="yes" means the key value is a sequence
 }
 
 // XSLNumber generates a formatted number in the result tree.

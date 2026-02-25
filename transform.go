@@ -4,7 +4,10 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"maps"
 	"os"
+	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -13,10 +16,101 @@ import (
 	"github.com/speedata/goxpath"
 )
 
+const nsFN = "http://www.w3.org/2005/xpath-functions"
+
+func init() {
+	goxpath.RegisterFunction(&goxpath.Function{
+		Name:      "regex-group",
+		Namespace: nsFN,
+		MinArg:    1,
+		MaxArg:    1,
+		F: func(ctx *goxpath.Context, args []goxpath.Sequence) (goxpath.Sequence, error) {
+			n, err := goxpath.NumberValue(args[0])
+			if err != nil {
+				return nil, err
+			}
+			idx := int(n)
+			if ctx.Store == nil {
+				return goxpath.Sequence{""}, nil
+			}
+			groups, ok := ctx.Store["regex-groups"].([]string)
+			if !ok || idx < 0 || idx >= len(groups) {
+				return goxpath.Sequence{""}, nil
+			}
+			return goxpath.Sequence{groups[idx]}, nil
+		},
+	})
+	goxpath.RegisterFunction(&goxpath.Function{
+		Name:      "current",
+		Namespace: nsFN,
+		F: func(ctx *goxpath.Context, args []goxpath.Sequence) (goxpath.Sequence, error) {
+			if item := ctx.CurrentItem(); item != nil {
+				return goxpath.Sequence{item}, nil
+			}
+			return goxpath.Sequence{}, nil
+		},
+	})
+	goxpath.RegisterFunction(&goxpath.Function{
+		Name:      "current-group",
+		Namespace: nsFN,
+		F: func(ctx *goxpath.Context, args []goxpath.Sequence) (goxpath.Sequence, error) {
+			if ctx.Store == nil {
+				return goxpath.Sequence{}, nil
+			}
+			if group, ok := ctx.Store["current-group"]; ok {
+				if seq, ok := group.(goxpath.Sequence); ok {
+					return seq, nil
+				}
+			}
+			return goxpath.Sequence{}, nil
+		},
+	})
+	goxpath.RegisterFunction(&goxpath.Function{
+		Name:      "current-grouping-key",
+		Namespace: nsFN,
+		F: func(ctx *goxpath.Context, args []goxpath.Sequence) (goxpath.Sequence, error) {
+			if ctx.Store == nil {
+				return goxpath.Sequence{""}, nil
+			}
+			if key, ok := ctx.Store["current-grouping-key"]; ok {
+				if s, ok := key.(string); ok {
+					return goxpath.Sequence{s}, nil
+				}
+			}
+			return goxpath.Sequence{""}, nil
+		},
+	})
+	goxpath.RegisterFunction(&goxpath.Function{
+		Name:      "generate-id",
+		Namespace: nsFN,
+		MaxArg:    1,
+		F: func(ctx *goxpath.Context, args []goxpath.Sequence) (goxpath.Sequence, error) {
+			var node any
+			if len(args) == 0 || len(args[0]) == 0 {
+				seq := ctx.GetContextSequence()
+				if len(seq) == 0 {
+					return goxpath.Sequence{""}, nil
+				}
+				node = seq[0]
+			} else {
+				node = args[0][0]
+			}
+			type hasID interface {
+				GetID() int
+			}
+			if n, ok := node.(hasID); ok {
+				return goxpath.Sequence{fmt.Sprintf("d%d", n.GetID())}, nil
+			}
+			return goxpath.Sequence{""}, nil
+		},
+	})
+}
+
 // TransformResult holds the primary and any secondary result documents.
 type TransformResult struct {
 	Document           *goxml.XMLDocument            // primary output
 	SecondaryDocuments map[string]*goxml.XMLDocument // href → document
+	Output             OutputProperties              // xsl:output settings
 }
 
 // TransformContext holds the state during XSLT transformation.
@@ -35,6 +129,14 @@ type TransformContext struct {
 	msgWriter          io.Writer                         // output for xsl:message (default os.Stderr)
 	MapBuilder         *goxpath.XPathMap                 // non-nil when inside xsl:map (xsl:map-entry appends here)
 	SecondaryDocuments map[string]*goxml.XMLDocument     // href → secondary result documents
+	keyIndexCache      map[string]*keyIndex              // keyName → built index (lazy)
+	documentCache      map[string]*goxml.XMLDocument     // absolute path → loaded document (for document())
+}
+
+// keyIndex holds a pre-built index mapping string key values to matching nodes
+// in document order.
+type keyIndex struct {
+	entries map[string][]goxml.XMLNode
 }
 
 // TransformOptions configures optional behavior for the transformation.
@@ -63,6 +165,7 @@ func TransformWithOptions(ss *Stylesheet, sourceDoc *goxml.XMLDocument, opts Tra
 		CurrentMode:        ss.DefaultMode,
 		DefaultMode:        ss.DefaultMode,
 		Modes:              ss.Modes,
+		CurrentNode:        sourceDoc,
 		SourceDoc:          sourceDoc,
 		XPath:              xp,
 		OutputStack:        []goxml.Appender{resultDoc},
@@ -75,6 +178,8 @@ func TransformWithOptions(ss *Stylesheet, sourceDoc *goxml.XMLDocument, opts Tra
 	// Set up XPath evaluation for match pattern predicates.
 	matchCtx.XPathEval = func(expr string, node goxml.XMLNode) (bool, error) {
 		tc.XPath.Ctx.SetContextSequence(goxpath.Sequence{node})
+		// current() in pattern predicates returns the node being matched.
+		tc.XPath.Ctx.SetCurrentItem(node)
 		result, err := tc.XPath.Evaluate(expr)
 		if err != nil {
 			return false, err
@@ -88,41 +193,99 @@ func TransformWithOptions(ss *Stylesheet, sourceDoc *goxml.XMLDocument, opts Tra
 		xp.Ctx.Namespaces[prefix] = uri
 	}
 
-	// Process global stylesheet parameters.
-	for _, p := range ss.GlobalParams {
-		if opts.Parameters != nil {
-			if val, ok := opts.Parameters[p.Name]; ok {
-				if p.As != nil {
-					var coerceErr error
-					val, coerceErr = coerceSequence(p.As, val)
-					if coerceErr != nil {
-						return nil, fmt.Errorf("xsl:param name='%s': %w", p.Name, coerceErr)
+	// Register key() and document() functions BEFORE processing global
+	// variables, because a global variable's select expression may call
+	// these functions (e.g. document('') in key-066).
+	tc.keyIndexCache = make(map[string]*keyIndex)
+	tc.documentCache = make(map[string]*goxml.XMLDocument)
+	tc.registerKeyFunction(ss)
+	tc.registerDocumentFunction()
+	tc.registerIDFunction()
+
+	// Process global params and variables in declaration order so that
+	// a param default can reference a preceding variable and vice versa.
+	for _, decl := range ss.GlobalDecls {
+		if decl.IsParam {
+			p := decl.Param
+			if opts.Parameters != nil {
+				if val, ok := opts.Parameters[p.Name]; ok {
+					if p.As != nil {
+						var coerceErr error
+						val, coerceErr = coerceSequence(p.As, val)
+						if coerceErr != nil {
+							return nil, fmt.Errorf("xsl:param name='%s': %w", p.Name, coerceErr)
+						}
 					}
+					xp.SetVariable(p.Name, val)
+					continue
 				}
-				xp.SetVariable(p.Name, val)
-				continue
 			}
-		}
-		// Use default value.
-		val, err := evalParamValue(tc, p.Select, p.Children)
-		if err != nil {
-			return nil, fmt.Errorf("xsl:param name='%s': %w", p.Name, err)
-		}
-		if p.As != nil {
-			val, err = coerceSequence(p.As, val)
+			// Use default value.
+			val, err := evalParamValue(tc, p.Select, p.Children)
 			if err != nil {
 				return nil, fmt.Errorf("xsl:param name='%s': %w", p.Name, err)
 			}
+			if p.As != nil {
+				val, err = coerceSequence(p.As, val)
+				if err != nil {
+					return nil, fmt.Errorf("xsl:param name='%s': %w", p.Name, err)
+				}
+			}
+			xp.SetVariable(p.Name, val)
+		} else {
+			v := decl.Var
+			if err := v.Execute(tc); err != nil {
+				return nil, fmt.Errorf("xsl:variable name='%s': %w", v.Name, err)
+			}
 		}
-		xp.SetVariable(p.Name, val)
 	}
 
-	// Process global stylesheet variables.
-	for i := range ss.GlobalVars {
-		if err := ss.GlobalVars[i].Execute(tc); err != nil {
-			return nil, fmt.Errorf("xsl:variable name='%s': %w", ss.GlobalVars[i].Name, err)
+	// Set up key lookup for match pattern key() support.
+	if len(ss.Keys) > 0 {
+		tc.keyIndexCache = make(map[string]*keyIndex)
+
+		matchCtx.KeyLookup = func(keyName, valueExpr string, ns map[string]string) []goxml.XMLNode {
+			idx, ok := tc.keyIndexCache[keyName]
+			if !ok {
+				idx = tc.buildKeyIndex(keyName)
+				tc.keyIndexCache[keyName] = idx
+			}
+			// Evaluate valueExpr: string literal or XPath expression.
+			trimmed := strings.TrimSpace(valueExpr)
+			if len(trimmed) >= 2 && ((trimmed[0] == '\'' && trimmed[len(trimmed)-1] == '\'') || (trimmed[0] == '"' && trimmed[len(trimmed)-1] == '"')) {
+				return idx.entries[trimmed[1:len(trimmed)-1]]
+			}
+			// XPath expression (e.g., $var) — evaluate it; may return a sequence.
+			origNS := tc.XPath.Ctx.Namespaces
+			if ns != nil {
+				for k, v := range ns {
+					tc.XPath.Ctx.Namespaces[k] = v
+				}
+			}
+			result, err := tc.XPath.Evaluate(trimmed)
+			tc.XPath.Ctx.Namespaces = origNS
+			if err != nil {
+				return nil
+			}
+			// Look up each value in the sequence separately.
+			if len(result) <= 1 {
+				return idx.entries[result.Stringvalue()]
+			}
+			seen := make(map[int]bool)
+			var nodes []goxml.XMLNode
+			for _, item := range result {
+				for _, n := range idx.entries[goxpath.ItemStringvalue(item)] {
+					if nid := n.GetID(); !seen[nid] {
+						seen[nid] = true
+						nodes = append(nodes, n)
+					}
+				}
+			}
+			return nodes
 		}
 	}
+
+	// (key() and document() are registered earlier, before global variable processing)
 
 	// Register stylesheet functions with the XPath evaluator.
 	for _, fdef := range ss.Functions {
@@ -193,6 +356,7 @@ func TransformWithOptions(ss *Stylesheet, sourceDoc *goxml.XMLDocument, opts Tra
 	return &TransformResult{
 		Document:           resultDoc,
 		SecondaryDocuments: tc.SecondaryDocuments,
+		Output:             ss.Output,
 	}, nil
 }
 
@@ -295,17 +459,16 @@ func (instr *LiteralElement) Execute(ctx *TransformContext) error {
 	// Propagate result namespaces to root-level output elements only.
 	// Child elements inherit namespace declarations in XML.
 	if _, isDoc := ctx.output().(*goxml.XMLDocument); isDoc {
-		for prefix, uri := range ctx.Stylesheet.ResultNamespaces {
-			elt.Namespaces[prefix] = uri
-		}
+		maps.Copy(elt.Namespaces, ctx.Stylesheet.ResultNamespaces)
 	}
 	for _, attr := range instr.Attributes {
 		val, err := ctx.evalAVT(attr.Value)
 		if err != nil {
 			return fmt.Errorf("literal element %s attribute %s: %w", instr.Name, attr.Name, err)
 		}
+		attrName := xml.Name{Local: attr.Name, Space: attr.Namespace}
 		elt.SetAttribute(xml.Attr{
-			Name:  xml.Name{Local: attr.Name},
+			Name:  attrName,
 			Value: val,
 		})
 	}
@@ -338,7 +501,7 @@ func (instr *XSLValueOf) Execute(ctx *TransformContext) error {
 	if err != nil {
 		return fmt.Errorf("xsl:value-of select='%s': %w", instr.Select, err)
 	}
-	text := result.Stringvalue()
+	text := result.StringvalueJoin(instr.Separator)
 	if text != "" {
 		ctx.output().Append(goxml.CharData{Contents: text})
 	}
@@ -410,12 +573,13 @@ func (instr *XSLForEach) Execute(ctx *TransformContext) error {
 		}
 	}
 
+	prevSize := ctx.XPath.Ctx.Size()
+	prevPos := ctx.XPath.Ctx.Pos
+	seqLen := len(result)
+
 	for i, item := range result {
 		prevNode := ctx.CurrentNode
 		prevItem := ctx.CurrentItem
-		prevPos := ctx.XPath.Ctx.Pos
-
-		ctx.XPath.Ctx.Pos = i + 1
 
 		if node, ok := item.(goxml.XMLNode); ok {
 			ctx.CurrentNode = node
@@ -425,6 +589,10 @@ func (instr *XSLForEach) Execute(ctx *TransformContext) error {
 		}
 
 		for _, child := range instr.Children {
+			// Reset position/size before each child instruction,
+			// because XPath evaluation may change ctx.size as a side effect.
+			ctx.XPath.Ctx.Pos = i + 1
+			ctx.XPath.Ctx.SetSize(seqLen)
 			if err := child.Execute(ctx); err != nil {
 				return err
 			}
@@ -432,8 +600,9 @@ func (instr *XSLForEach) Execute(ctx *TransformContext) error {
 
 		ctx.CurrentNode = prevNode
 		ctx.CurrentItem = prevItem
-		ctx.XPath.Ctx.Pos = prevPos
 	}
+	ctx.XPath.Ctx.Pos = prevPos
+	ctx.XPath.Ctx.SetSize(prevSize)
 	return nil
 }
 
@@ -454,23 +623,35 @@ func (instr *XSLForEachGroup) Execute(ctx *TransformContext) error {
 		nodes []goxml.XMLNode
 	}
 	var groups []group
-	keyIndex := make(map[string]int) // key -> index in groups
 
-	for _, node := range nodes {
-		prevNode := ctx.CurrentNode
-		ctx.CurrentNode = node
-		keyResult, err := ctx.evalXPath(instr.GroupBy)
-		ctx.CurrentNode = prevNode
-		if err != nil {
-			return fmt.Errorf("xsl:for-each-group group-by='%s': %w", instr.GroupBy, err)
+	if instr.GroupStartingPat != nil {
+		// group-starting-with: start a new group each time a node matches the pattern.
+		for _, node := range nodes {
+			if instr.GroupStartingPat.Matches(node, ctx.MatchCtx) || len(groups) == 0 {
+				groups = append(groups, group{nodes: []goxml.XMLNode{node}})
+			} else {
+				groups[len(groups)-1].nodes = append(groups[len(groups)-1].nodes, node)
+			}
 		}
-		key := keyResult.Stringvalue()
+	} else {
+		// group-by: group by evaluated key expression.
+		keyIdx := make(map[string]int) // key -> index in groups
+		for _, node := range nodes {
+			prevNode := ctx.CurrentNode
+			ctx.CurrentNode = node
+			keyResult, err := ctx.evalXPath(instr.GroupBy)
+			ctx.CurrentNode = prevNode
+			if err != nil {
+				return fmt.Errorf("xsl:for-each-group group-by='%s': %w", instr.GroupBy, err)
+			}
+			key := keyResult.Stringvalue()
 
-		if idx, ok := keyIndex[key]; ok {
-			groups[idx].nodes = append(groups[idx].nodes, node)
-		} else {
-			keyIndex[key] = len(groups)
-			groups = append(groups, group{key: key, nodes: []goxml.XMLNode{node}})
+			if idx, ok := keyIdx[key]; ok {
+				groups[idx].nodes = append(groups[idx].nodes, node)
+			} else {
+				keyIdx[key] = len(groups)
+				groups = append(groups, group{key: key, nodes: []goxml.XMLNode{node}})
+			}
 		}
 	}
 
@@ -598,7 +779,7 @@ func (instr *XSLVariable) Execute(ctx *TransformContext) error {
 			}
 			seq = goxpath.Sequence{m}
 		} else {
-			// Single non-map child → build a result tree fragment.
+			// Single non-map child → build a temporary document node (XSLT 2.0+).
 			fragDoc := &goxml.XMLDocument{}
 			ctx.pushOutput(fragDoc)
 			if err := instr.Children[0].Execute(ctx); err != nil {
@@ -606,12 +787,10 @@ func (instr *XSLVariable) Execute(ctx *TransformContext) error {
 				return err
 			}
 			ctx.popOutput()
-			for _, child := range fragDoc.Children() {
-				seq = append(seq, child)
-			}
+			seq = goxpath.Sequence{fragDoc}
 		}
 	} else if len(instr.Children) > 0 {
-		// Variable bound via body content → build a result tree fragment.
+		// Variable bound via body content → build a temporary document node (XSLT 2.0+).
 		fragDoc := &goxml.XMLDocument{}
 		ctx.pushOutput(fragDoc)
 		for _, child := range instr.Children {
@@ -621,10 +800,7 @@ func (instr *XSLVariable) Execute(ctx *TransformContext) error {
 			}
 		}
 		ctx.popOutput()
-		// Set the variable to the children of the fragment.
-		for _, child := range fragDoc.Children() {
-			seq = append(seq, child)
-		}
+		seq = goxpath.Sequence{fragDoc}
 	} else {
 		// Empty variable → empty string.
 		seq = goxpath.Sequence{""}
@@ -647,6 +823,11 @@ func (instr *XSLCopyOf) Execute(ctx *TransformContext) error {
 	}
 	for _, item := range result {
 		switch n := item.(type) {
+		case *goxml.XMLDocument:
+			// copy-of a document node copies its children, not the document node itself.
+			for _, child := range n.Children() {
+				ctx.output().Append(child)
+			}
 		case goxml.XMLNode:
 			ctx.output().Append(n)
 		case string:
@@ -663,6 +844,10 @@ func (instr *XSLSequence) Execute(ctx *TransformContext) error {
 	}
 	for _, item := range result {
 		switch n := item.(type) {
+		case *goxml.XMLDocument:
+			for _, child := range n.Children() {
+				ctx.output().Append(child)
+			}
 		case goxml.XMLNode:
 			ctx.output().Append(n)
 		default:
@@ -808,6 +993,143 @@ func (instr *XSLMessage) Execute(ctx *TransformContext) error {
 	if instr.Terminate {
 		return fmt.Errorf("XTMM9000: xsl:message terminate='yes': %s", text)
 	}
+	return nil
+}
+
+// --------------------------------------------------------------------------
+// XSLAnalyzeString
+// --------------------------------------------------------------------------
+
+func (instr *XSLAnalyzeString) Execute(ctx *TransformContext) error {
+	// 1. Evaluate select → input string.
+	result, err := ctx.evalXPath(instr.Select)
+	if err != nil {
+		return fmt.Errorf("xsl:analyze-string select='%s': %w", instr.Select, err)
+	}
+	input := result.Stringvalue()
+
+	// 2. Evaluate regex AVT → pattern string.
+	pattern, err := ctx.evalAVT(instr.Regex)
+	if err != nil {
+		return fmt.Errorf("xsl:analyze-string regex: %w", err)
+	}
+
+	// 3. Evaluate flags AVT → Go regex prefix.
+	if len(instr.Flags.Parts) > 0 {
+		flags, err := ctx.evalAVT(instr.Flags)
+		if err != nil {
+			return fmt.Errorf("xsl:analyze-string flags: %w", err)
+		}
+		var prefix strings.Builder
+		for _, ch := range flags {
+			switch ch {
+			case 'i', 's', 'm':
+				prefix.WriteString("(?")
+				prefix.WriteRune(ch)
+				prefix.WriteByte(')')
+			case 'x':
+				// Go's regexp doesn't support x flag; ignore.
+			}
+		}
+		if prefix.Len() > 0 {
+			pattern = prefix.String() + pattern
+		}
+	}
+
+	// 4. Compile regex.
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return fmt.Errorf("xsl:analyze-string regex='%s': %w", pattern, err)
+	}
+
+	// 5. Find all matches with subgroup positions.
+	matches := re.FindAllStringSubmatchIndex(input, -1)
+
+	// Save/restore Store for regex-groups.
+	if ctx.XPath.Ctx.Store == nil {
+		ctx.XPath.Ctx.Store = make(map[interface{}]interface{})
+	}
+	prevGroups := ctx.XPath.Ctx.Store["regex-groups"]
+
+	// 6. Iterate through the input, processing non-matching and matching segments.
+	pos := 0
+	for _, match := range matches {
+		matchStart := match[0]
+		matchEnd := match[1]
+
+		// Non-matching segment before this match.
+		if pos < matchStart && len(instr.NonMatching) > 0 {
+			nonMatchText := input[pos:matchStart]
+			prevNode := ctx.CurrentNode
+			prevItem := ctx.CurrentItem
+			ctx.CurrentItem = nonMatchText
+			for _, child := range instr.NonMatching {
+				if err := child.Execute(ctx); err != nil {
+					ctx.CurrentNode = prevNode
+					ctx.CurrentItem = prevItem
+					ctx.XPath.Ctx.Store["regex-groups"] = prevGroups
+					return err
+				}
+			}
+			ctx.CurrentNode = prevNode
+			ctx.CurrentItem = prevItem
+		}
+
+		// Matching segment: extract capture groups.
+		if len(instr.Matching) > 0 {
+			numGroups := len(match)/2 - 1
+			groups := make([]string, numGroups+1)
+			groups[0] = input[matchStart:matchEnd]
+			for g := 1; g <= numGroups; g++ {
+				start := match[2*g]
+				end := match[2*g+1]
+				if start >= 0 && end >= 0 {
+					groups[g] = input[start:end]
+				}
+			}
+			ctx.XPath.Ctx.Store["regex-groups"] = groups
+
+			matchText := input[matchStart:matchEnd]
+			prevNode := ctx.CurrentNode
+			prevItem := ctx.CurrentItem
+			ctx.CurrentItem = matchText
+			for _, child := range instr.Matching {
+				if err := child.Execute(ctx); err != nil {
+					ctx.CurrentNode = prevNode
+					ctx.CurrentItem = prevItem
+					ctx.XPath.Ctx.Store["regex-groups"] = prevGroups
+					return err
+				}
+			}
+			ctx.CurrentNode = prevNode
+			ctx.CurrentItem = prevItem
+		}
+
+		pos = matchEnd
+	}
+
+	// Trailing non-matching segment.
+	if pos < len(input) && len(instr.NonMatching) > 0 {
+		nonMatchText := input[pos:]
+		prevNode := ctx.CurrentNode
+		prevItem := ctx.CurrentItem
+		ctx.CurrentItem = nonMatchText
+		ctx.CurrentNode = nil
+		for _, child := range instr.NonMatching {
+			if err := child.Execute(ctx); err != nil {
+				ctx.CurrentNode = prevNode
+				ctx.CurrentItem = prevItem
+				ctx.XPath.Ctx.Store["regex-groups"] = prevGroups
+				return err
+			}
+		}
+		ctx.CurrentNode = prevNode
+		ctx.CurrentItem = prevItem
+	}
+
+	// Restore previous regex-groups.
+	ctx.XPath.Ctx.Store["regex-groups"] = prevGroups
+
 	return nil
 }
 
@@ -1020,6 +1342,13 @@ func (instr *XSLCopy) Execute(ctx *TransformContext) error {
 			}
 		}
 		ctx.popOutput()
+	case goxml.Attribute:
+		if elt, ok := ctx.output().(*goxml.Element); ok {
+			elt.SetAttribute(xml.Attr{
+				Name:  xml.Name{Local: n.Name, Space: n.Namespace},
+				Value: n.Value,
+			})
+		}
 	case goxml.CharData:
 		ctx.output().Append(goxml.CharData{Contents: n.Contents})
 	case goxml.Comment:
@@ -1072,7 +1401,7 @@ func (instr *XSLAttribute) Execute(ctx *TransformContext) error {
 
 	elt, ok := ctx.output().(*goxml.Element)
 	if !ok {
-		return fmt.Errorf("xsl:attribute '%s': output is not an element", name)
+		return fmt.Errorf("xsl:attribute '%s': output is not an element (%T)", name, ctx.output())
 	}
 	elt.SetAttribute(xml.Attr{Name: xml.Name{Local: name}, Value: value})
 	return nil
@@ -1252,8 +1581,10 @@ func (tc *TransformContext) sortNodes(nodes []goxml.XMLNode, sorts []SortKey) er
 func (tc *TransformContext) evalXPath(expr string) (goxpath.Sequence, error) {
 	if tc.CurrentItem != nil {
 		tc.XPath.Ctx.SetContextSequence(goxpath.Sequence{tc.CurrentItem})
+		tc.XPath.Ctx.SetCurrentItem(tc.CurrentItem)
 	} else {
 		tc.XPath.Ctx.SetContextSequence(goxpath.Sequence{tc.CurrentNode})
+		tc.XPath.Ctx.SetCurrentItem(tc.CurrentNode)
 	}
 	return tc.XPath.Evaluate(expr)
 }
@@ -1308,12 +1639,296 @@ func (b *TextOnlyCopyRuleSet) Process(node goxml.XMLNode, ctx *TransformContext)
 }
 
 // --------------------------------------------------------------------------
+// Key index helpers
+// --------------------------------------------------------------------------
+
+// buildKeyIndex builds the index for the named key by traversing the source
+// document and evaluating the use expression for each matching node.
+func (tc *TransformContext) buildKeyIndex(keyName string) *keyIndex {
+	return tc.buildKeyIndexFrom(keyName, tc.SourceDoc)
+}
+
+// buildKeyIndexFrom builds the index for the named key by traversing the tree
+// rooted at root and evaluating the use expression for each matching node.
+func (tc *TransformContext) buildKeyIndexFrom(keyName string, root goxml.XMLNode) *keyIndex {
+	idx := &keyIndex{entries: make(map[string][]goxml.XMLNode)}
+	// Track which (key-value, node-id) pairs have been added to avoid duplicates
+	// when multiple xsl:key definitions with the same name match the same node.
+	seen := make(map[string]map[int]bool)
+	for _, kd := range tc.Stylesheet.Keys {
+		if kd.Name != keyName {
+			continue
+		}
+		walkNodes(root, func(node goxml.XMLNode) {
+			if !kd.Match.Matches(node, tc.MatchCtx) {
+				return
+			}
+			// Evaluate the use expression in the context of the matched node.
+			prevNode := tc.CurrentNode
+			tc.CurrentNode = node
+			result, err := tc.evalXPath(kd.Use)
+			tc.CurrentNode = prevNode
+			if err != nil {
+				return
+			}
+			// Each item in the result creates a separate index entry,
+			// so a single node can be indexed under multiple keys.
+			nid := node.GetID()
+			for _, item := range result {
+				key := goxpath.ItemStringvalue(item)
+				if seen[key] == nil {
+					seen[key] = make(map[int]bool)
+				}
+				if !seen[key][nid] {
+					seen[key][nid] = true
+					idx.entries[key] = append(idx.entries[key], node)
+				}
+			}
+		})
+	}
+	return idx
+}
+
+// loadDocument loads an external XML document by URI, resolving relative paths
+// against the stylesheet's base path. document(”) returns the stylesheet itself.
+// Documents are cached so that repeated calls return the same instance.
+func (tc *TransformContext) loadDocument(uri string) (*goxml.XMLDocument, error) {
+	if uri == "" {
+		// document('') returns the stylesheet document itself.
+		if tc.Stylesheet.StylesheetDoc == nil {
+			return nil, fmt.Errorf("document(''): stylesheet document not available")
+		}
+		return tc.Stylesheet.StylesheetDoc, nil
+	}
+
+	// Resolve relative URI against the stylesheet's base path.
+	absPath := uri
+	if !filepath.IsAbs(uri) && tc.Stylesheet.BasePath != "" {
+		absPath = filepath.Join(tc.Stylesheet.BasePath, uri)
+	}
+	absPath, _ = filepath.Abs(absPath)
+
+	// Return cached document if already loaded.
+	if doc, ok := tc.documentCache[absPath]; ok {
+		return doc, nil
+	}
+
+	// Parse the document.
+	f, err := os.Open(absPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	doc, err := goxml.Parse(f)
+	if err != nil {
+		return nil, fmt.Errorf("parsing %s: %w", uri, err)
+	}
+
+	tc.documentCache[absPath] = doc
+	return doc, nil
+}
+
+// registerKeyFunction registers the key() XPath function for this transformation.
+func (tc *TransformContext) registerKeyFunction(ss *Stylesheet) {
+	goxpath.RegisterFunction(&goxpath.Function{
+		Name:      "key",
+		Namespace: "http://www.w3.org/2005/xpath-functions",
+		MinArg:    2,
+		MaxArg:    3,
+		F: func(xpCtx *goxpath.Context, args []goxpath.Sequence) (goxpath.Sequence, error) {
+			keyName := expandQName(args[0].Stringvalue(), xpCtx.Namespaces)
+
+			// XTDE1260: check that a key with this name has been defined.
+			keyExists := false
+			for _, kd := range ss.Keys {
+				if kd.Name == keyName {
+					keyExists = true
+					break
+				}
+			}
+			if !keyExists {
+				return nil, fmt.Errorf("XTDE1260: no key named '%s' has been defined", keyName)
+			}
+
+			var idx *keyIndex
+			if len(args) >= 3 && len(args[2]) > 0 {
+				// 3-arg form: build index from each subtree root in arg3.
+				idx = &keyIndex{entries: make(map[string][]goxml.XMLNode)}
+				for _, item := range args[2] {
+					if node, ok := item.(goxml.XMLNode); ok {
+						subIdx := tc.buildKeyIndexFrom(keyName, node)
+						for k, nodes := range subIdx.entries {
+							idx.entries[k] = append(idx.entries[k], nodes...)
+						}
+					}
+				}
+			} else {
+				// 2-arg form: determine document root from context node.
+				var docRoot *goxml.XMLDocument
+				ctxSeq := xpCtx.GetContextSequence()
+				if len(ctxSeq) > 0 {
+					if node, ok := ctxSeq[0].(goxml.XMLNode); ok {
+						if dr, ok := documentRoot(node).(*goxml.XMLDocument); ok {
+							docRoot = dr
+						}
+					}
+				}
+				if docRoot == nil || docRoot == tc.SourceDoc {
+					// Source document: use cache.
+					var ok bool
+					idx, ok = tc.keyIndexCache[keyName]
+					if !ok {
+						idx = tc.buildKeyIndex(keyName)
+						tc.keyIndexCache[keyName] = idx
+					}
+				} else {
+					// RTF or other document: build fresh index.
+					idx = tc.buildKeyIndexFrom(keyName, docRoot)
+				}
+			}
+
+			// Atomize: look up each item's string value separately,
+			// collecting unique nodes in document order.
+			seen := make(map[int]bool)
+			var seq goxpath.Sequence
+			for _, item := range args[1] {
+				sv := goxpath.ItemStringvalue(item)
+				for _, n := range idx.entries[sv] {
+					nid := n.GetID()
+					if !seen[nid] {
+						seen[nid] = true
+						seq = append(seq, n)
+					}
+				}
+			}
+			return seq, nil
+		},
+	})
+}
+
+// registerDocumentFunction registers the document() XPath function.
+func (tc *TransformContext) registerDocumentFunction() {
+	goxpath.RegisterFunction(&goxpath.Function{
+		Name:      "document",
+		Namespace: nsFN,
+		MinArg:    1,
+		MaxArg:    1,
+		F: func(xpCtx *goxpath.Context, args []goxpath.Sequence) (goxpath.Sequence, error) {
+			var seq goxpath.Sequence
+			for _, item := range args[0] {
+				uri := goxpath.ItemStringvalue(item)
+				doc, err := tc.loadDocument(uri)
+				if err != nil {
+					return nil, fmt.Errorf("document('%s'): %w", uri, err)
+				}
+				seq = append(seq, doc)
+			}
+			if len(args[0]) == 0 {
+				return goxpath.Sequence{}, nil
+			}
+			return seq, nil
+		},
+	})
+}
+
+// registerIDFunction registers the id() XPath function.
+// id(value) returns elements with a matching xml:id attribute in the context document.
+// id(value, node) returns elements in the document containing node.
+func (tc *TransformContext) registerIDFunction() {
+	goxpath.RegisterFunction(&goxpath.Function{
+		Name:      "id",
+		Namespace: nsFN,
+		MinArg:    1,
+		MaxArg:    2,
+		F: func(xpCtx *goxpath.Context, args []goxpath.Sequence) (goxpath.Sequence, error) {
+			// Determine the document to search.
+			var root goxml.XMLNode
+			if len(args) >= 2 && len(args[1]) > 0 {
+				root = args[1][0].(goxml.XMLNode)
+			} else {
+				// Use the context node's document.
+				root = tc.SourceDoc
+			}
+			// Walk up to document root.
+			root = documentRoot(root)
+			// Collect IDREFS (space-separated list of IDs).
+			var ids []string
+			for _, item := range args[0] {
+				sv := goxpath.ItemStringvalue(item)
+				for _, id := range strings.Fields(sv) {
+					ids = append(ids, id)
+				}
+			}
+			// Search for elements with matching xml:id.
+			var seq goxpath.Sequence
+			seen := make(map[int]bool)
+			walkNodes(root, func(node goxml.XMLNode) {
+				elt, ok := node.(*goxml.Element)
+				if !ok {
+					return
+				}
+				for _, attr := range elt.Attributes() {
+					if (attr.Name == "id" || attr.Name == "xml:id") && attr.Namespace == "http://www.w3.org/XML/1998/namespace" {
+						for _, id := range ids {
+							if strings.TrimSpace(attr.Value) == id {
+								nid := elt.GetID()
+								if !seen[nid] {
+									seen[nid] = true
+									seq = append(seq, elt)
+								}
+								return
+							}
+						}
+					}
+				}
+			})
+			return seq, nil
+		},
+	})
+}
+
+// walkNodes calls fn for every node in the document tree (depth-first).
+func walkNodes(node goxml.XMLNode, fn func(goxml.XMLNode)) {
+	fn(node)
+	// Also visit attributes so that match="@foo" patterns work in xsl:key.
+	if elt, ok := node.(*goxml.Element); ok {
+		for _, attr := range elt.Attributes() {
+			fn(attr)
+		}
+	}
+	for _, child := range node.Children() {
+		walkNodes(child, fn)
+	}
+}
+
+// --------------------------------------------------------------------------
 // Result serialization
 // --------------------------------------------------------------------------
 
 // SerializeResult converts a result document to an XML string.
 func SerializeResult(doc *goxml.XMLDocument) string {
 	return doc.ToXML()
+}
+
+// SerializeWithOutput converts a result document to a string using the given output properties.
+func SerializeWithOutput(doc *goxml.XMLDocument, output OutputProperties) string {
+	var sb strings.Builder
+	if output.Method != "text" && !output.OmitXMLDeclaration {
+		sb.WriteString(`<?xml version="1.0" encoding="UTF-8"?>`)
+		if output.Indent {
+			sb.WriteByte('\n')
+		}
+	}
+	if output.Indent {
+		nsPrinted := make(map[string]bool)
+		for _, child := range doc.Children() {
+			serializeIndentNode(&sb, child, 0, "  ", nsPrinted)
+		}
+	} else {
+		sb.WriteString(doc.ToXML())
+	}
+	return sb.String()
 }
 
 // SerializeIndent converts a result document to an indented XML string.

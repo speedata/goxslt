@@ -93,6 +93,9 @@ func CompileFile(xsltPath string) (*Stylesheet, error) {
 		m.ComputeRankings()
 	}
 
+	ss.BasePath = filepath.Dir(absPath)
+	ss.StylesheetDoc = xsltDoc
+
 	return ss, nil
 }
 
@@ -222,6 +225,9 @@ func (cc *compileContext) compileStylesheet(xsltDoc *goxml.XMLDocument) error {
 			if v := attrValue(elt, "version"); v != "" {
 				cc.ss.Output.Version = v
 			}
+			if v := attrValue(elt, "omit-xml-declaration"); v != "" {
+				cc.ss.Output.OmitXMLDeclaration = (v == "yes")
+			}
 		case "function":
 			if err := cc.compileFunction(elt); err != nil {
 				return err
@@ -248,13 +254,49 @@ func (cc *compileContext) compileStylesheet(xsltDoc *goxml.XMLDocument) error {
 					return fmt.Errorf("XSLT: xsl:param name='%s' as='%s': %w", name, asStr, err)
 				}
 			}
-			cc.ss.GlobalParams = append(cc.ss.GlobalParams, TemplateParam{Name: name, Select: sel, Children: children, As: asType})
+			p := TemplateParam{Name: name, Select: sel, Children: children, As: asType}
+			cc.ss.GlobalParams = append(cc.ss.GlobalParams, p)
+			cc.ss.GlobalDecls = append(cc.ss.GlobalDecls, GlobalDecl{IsParam: true, Param: &cc.ss.GlobalParams[len(cc.ss.GlobalParams)-1]})
 		case "variable":
 			v, err := compileVariable(elt)
 			if err != nil {
 				return err
 			}
 			cc.ss.GlobalVars = append(cc.ss.GlobalVars, *v)
+			cc.ss.GlobalDecls = append(cc.ss.GlobalDecls, GlobalDecl{IsParam: false, Var: &cc.ss.GlobalVars[len(cc.ss.GlobalVars)-1]})
+		case "key":
+			name := attrValue(elt, "name")
+			if name == "" {
+				return fmt.Errorf("XSLT: xsl:key missing name attribute (line %d)", elt.Line)
+			}
+			matchStr := attrValue(elt, "match")
+			if matchStr == "" {
+				return fmt.Errorf("XSLT: xsl:key missing match attribute (line %d)", elt.Line)
+			}
+			use := attrValue(elt, "use")
+			if use == "" {
+				return fmt.Errorf("XSLT: xsl:key missing use attribute (line %d)", elt.Line)
+			}
+			// XTSE0010: xsl:key must not contain child elements when use is specified.
+			for _, child := range elt.Children() {
+				if _, ok := child.(*goxml.Element); ok {
+					return fmt.Errorf("XTSE0010: xsl:key must not contain child elements (line %d)", elt.Line)
+				}
+			}
+			pat, err := parseMatchPattern(matchStr, cc.ss.Namespaces)
+			if err != nil {
+				return fmt.Errorf("XSLT: xsl:key match='%s': %w", matchStr, err)
+			}
+			composite := attrValue(elt, "composite") == "yes"
+			expandedName := expandQName(name, elt.Namespaces)
+			// XTSE1222: all xsl:key declarations with the same name must have
+			// the same effective value for the composite attribute.
+			for _, existing := range cc.ss.Keys {
+				if existing.Name == expandedName && existing.Composite != composite {
+					return fmt.Errorf("XTSE1222: xsl:key declarations with name '%s' have inconsistent composite attribute (line %d)", name, elt.Line)
+				}
+			}
+			cc.ss.Keys = append(cc.ss.Keys, KeyDefinition{Name: expandedName, Match: pat, Use: use, Composite: composite})
 		}
 	}
 
@@ -335,9 +377,10 @@ func (cc *compileContext) processInclude(elt *goxml.Element) error {
 
 // OutputProperties holds xsl:output settings.
 type OutputProperties struct {
-	Method  string // "xml", "html", "text"
-	Indent  bool
-	Version string
+	Method             string // "xml", "html", "text"
+	Indent             bool
+	Version            string
+	OmitXMLDeclaration bool // omit-xml-declaration="yes" → true
 }
 
 // FunctionDef holds a compiled xsl:function definition.
@@ -356,10 +399,21 @@ type Stylesheet struct {
 	Output           OutputProperties
 	NamedTemplates   map[string]*TemplateBody
 	Functions        map[string]*FunctionDef // key = "namespace localname"
+	Keys             []KeyDefinition         // xsl:key declarations
 	Namespaces       map[string]string       // prefix → URI from root element
 	ResultNamespaces map[string]string       // prefix → URI to propagate to output elements
 	GlobalParams     []TemplateParam         // top-level xsl:param declarations
 	GlobalVars       []XSLVariable           // top-level xsl:variable declarations
+	GlobalDecls      []GlobalDecl            // params and variables in declaration order
+	BasePath         string                  // directory for resolving document() URIs
+	StylesheetDoc    *goxml.XMLDocument      // parsed stylesheet document (for document(''))
+}
+
+// GlobalDecl represents a top-level parameter or variable in declaration order.
+type GlobalDecl struct {
+	IsParam bool
+	Param   *TemplateParam
+	Var     *XSLVariable
 }
 
 func (cc *compileContext) compileTemplate(elt *goxml.Element) error {
@@ -502,7 +556,14 @@ func compileXSLInstruction(elt *goxml.Element, namespaces map[string]string) (In
 		if sel == "" {
 			return nil, fmt.Errorf("XSLT: xsl:value-of missing select attribute (line %d)", elt.Line)
 		}
-		return &XSLValueOf{Select: sel}, nil
+		sep := " " // XSLT 2.0+ default separator
+		for _, attr := range elt.Attributes() {
+			if attr.Name == "separator" {
+				sep = attr.Value
+				break
+			}
+		}
+		return &XSLValueOf{Select: sel, Separator: sep}, nil
 
 	case "for-each":
 		sel := attrValue(elt, "select")
@@ -616,8 +677,17 @@ func compileXSLInstruction(elt *goxml.Element, namespaces map[string]string) (In
 			return nil, fmt.Errorf("XSLT: xsl:for-each-group missing select attribute (line %d)", elt.Line)
 		}
 		groupBy := attrValue(elt, "group-by")
-		if groupBy == "" {
-			return nil, fmt.Errorf("XSLT: xsl:for-each-group missing group-by attribute (line %d)", elt.Line)
+		groupStartingWith := attrValue(elt, "group-starting-with")
+		if groupBy == "" && groupStartingWith == "" {
+			return nil, fmt.Errorf("XSLT: xsl:for-each-group missing group-by or group-starting-with attribute (line %d)", elt.Line)
+		}
+		var groupStartingPat Pattern
+		if groupStartingWith != "" {
+			var patErr error
+			groupStartingPat, patErr = parseMatchPattern(groupStartingWith, namespaces)
+			if patErr != nil {
+				return nil, fmt.Errorf("XSLT: xsl:for-each-group group-starting-with (line %d): %w", elt.Line, patErr)
+			}
 		}
 		sorts, err := extractSorts(elt)
 		if err != nil {
@@ -627,10 +697,17 @@ func compileXSLInstruction(elt *goxml.Element, namespaces map[string]string) (In
 		if err != nil {
 			return nil, err
 		}
-		return &XSLForEachGroup{Select: sel, GroupBy: groupBy, Sorts: sorts, Children: children}, nil
+		return &XSLForEachGroup{Select: sel, GroupBy: groupBy, GroupStartingPat: groupStartingPat, Sorts: sorts, Children: children}, nil
 
 	case "result-document":
 		return compileResultDocument(elt, namespaces)
+
+	case "analyze-string":
+		return compileAnalyzeString(elt, namespaces)
+
+	case "matching-substring", "non-matching-substring":
+		// Handled by the parent (analyze-string).
+		return nil, nil
 
 	case "sort":
 		// xsl:sort is handled by the parent (for-each / apply-templates).
@@ -721,7 +798,11 @@ func compileLiteralElement(elt *goxml.Element, namespaces ...map[string]string) 
 		if err != nil {
 			return nil, fmt.Errorf("XSLT: error parsing AVT in attribute %s: %w", attr.Name, err)
 		}
-		attrs = append(attrs, LiteralAttribute{Name: attr.Name, Value: avt})
+		attrName := attr.Name
+		if attr.Prefix != "" {
+			attrName = attr.Prefix + ":" + attr.Name
+		}
+		attrs = append(attrs, LiteralAttribute{Name: attrName, Namespace: attr.Namespace, Value: avt})
 	}
 
 	children, err := compileChildren(elt, ns)
@@ -1163,9 +1244,25 @@ func parseBasePattern(s string, namespaces map[string]string) (Pattern, error) {
 		return &AnyNodeTest{}, nil
 	}
 
-	// Attribute pattern: @name
+	// key() pattern: key('name', expr)
+	if strings.HasPrefix(s, "key(") {
+		return parseKeyPattern(s, namespaces)
+	}
+
+	// Attribute pattern: @name or @*
 	if strings.HasPrefix(s, "@") {
 		name := s[1:]
+		if name == "*" {
+			return &WildcardTest{Kind: NodeAttribute}, nil
+		}
+		if strings.Contains(name, ":") {
+			parts := strings.SplitN(name, ":", 2)
+			nsURI := namespaces[parts[0]]
+			if parts[1] == "*" {
+				return &NamespaceWildcardTest{NamespaceURI: nsURI, Kind: NodeAttribute}, nil
+			}
+			return &NameTest{LocalName: parts[1], NamespaceURI: nsURI, Kind: NodeAttribute}, nil
+		}
 		return &NameTest{LocalName: name, Kind: NodeAttribute}, nil
 	}
 
@@ -1229,6 +1326,19 @@ func attrValue(elt *goxml.Element, name string) string {
 		}
 	}
 	return ""
+}
+
+// expandQName expands a prefixed QName to Clark notation {uri}local using the
+// given namespace mapping. Unprefixed names are returned unchanged.
+func expandQName(name string, namespaces map[string]string) string {
+	if idx := strings.IndexByte(name, ':'); idx >= 0 {
+		prefix := name[:idx]
+		local := name[idx+1:]
+		if ns, ok := namespaces[prefix]; ok {
+			return "{" + ns + "}" + local
+		}
+	}
+	return name
 }
 
 // compileElement compiles an xsl:element instruction.
@@ -1357,6 +1467,62 @@ func compileResultDocument(elt *goxml.Element, namespaces map[string]string) (*X
 	return &XSLResultDocument{Href: hrefAVT, Children: children}, nil
 }
 
+// compileAnalyzeString compiles an xsl:analyze-string instruction.
+func compileAnalyzeString(elt *goxml.Element, namespaces map[string]string) (*XSLAnalyzeString, error) {
+	sel := attrValue(elt, "select")
+	if sel == "" {
+		return nil, fmt.Errorf("XSLT: xsl:analyze-string missing select attribute (line %d)", elt.Line)
+	}
+	regexStr := attrValue(elt, "regex")
+	if regexStr == "" {
+		return nil, fmt.Errorf("XSLT: xsl:analyze-string missing regex attribute (line %d)", elt.Line)
+	}
+	regexAVT, err := parseAVT(regexStr)
+	if err != nil {
+		return nil, fmt.Errorf("XSLT: error parsing regex AVT in xsl:analyze-string: %w", err)
+	}
+	var flagsAVT AVT
+	if flagsStr := attrValue(elt, "flags"); flagsStr != "" {
+		flagsAVT, err = parseAVT(flagsStr)
+		if err != nil {
+			return nil, fmt.Errorf("XSLT: error parsing flags AVT in xsl:analyze-string: %w", err)
+		}
+	}
+
+	instr := &XSLAnalyzeString{
+		Select: sel,
+		Regex:  regexAVT,
+		Flags:  flagsAVT,
+	}
+
+	for _, child := range elt.Children() {
+		childElt, ok := child.(*goxml.Element)
+		if !ok {
+			continue
+		}
+		childNS := childElt.Namespaces[childElt.Prefix]
+		if childNS != xslNS {
+			continue
+		}
+		switch childElt.Name {
+		case "matching-substring":
+			children, err := compileChildren(childElt, namespaces)
+			if err != nil {
+				return nil, err
+			}
+			instr.Matching = children
+		case "non-matching-substring":
+			children, err := compileChildren(childElt, namespaces)
+			if err != nil {
+				return nil, err
+			}
+			instr.NonMatching = children
+		}
+	}
+
+	return instr, nil
+}
+
 // --------------------------------------------------------------------------
 // Predicate-aware helpers for pattern parsing
 // --------------------------------------------------------------------------
@@ -1436,8 +1602,93 @@ func findMatchingBracket(s string) int {
 	return -1
 }
 
+// findMatchingParen returns the index of the ')' matching the '(' at position 0.
+// Returns -1 if not found.
+func findMatchingParen(s string) int {
+	if len(s) == 0 || s[0] != '(' {
+		return -1
+	}
+	depth := 0
+	inStr := false
+	var strCh byte
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if inStr {
+			if ch == strCh {
+				inStr = false
+			}
+			continue
+		}
+		switch ch {
+		case '\'', '"':
+			inStr = true
+			strCh = ch
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// parseKeyPattern parses "key('name', expr)" into a KeyPattern.
+func parseKeyPattern(s string, namespaces map[string]string) (*KeyPattern, error) {
+	// s starts with "key(" — find matching ")"
+	inner := s[3:] // starts with "("
+	end := findMatchingParen(inner)
+	if end < 0 {
+		return nil, fmt.Errorf("unmatched '(' in key pattern: %s", s)
+	}
+	if end+3 != len(s)-1 {
+		// Trailing content after ) — shouldn't happen for a base pattern
+		// (path continuations are handled by parsePathPattern)
+		trail := strings.TrimSpace(s[end+4:])
+		if trail != "" {
+			return nil, fmt.Errorf("unexpected content after key() pattern: %s", trail)
+		}
+	}
+	content := inner[1:end] // content between ( and )
+
+	// Split on top-level comma to get two arguments
+	args := splitTopLevelOn(content, ',')
+	if len(args) != 2 {
+		return nil, fmt.Errorf("key() pattern requires exactly 2 arguments, got %d: %s", len(args), s)
+	}
+
+	// First argument: key name (string literal)
+	keyNameRaw := strings.TrimSpace(args[0])
+	keyName, err := stripStringLiteral(keyNameRaw)
+	if err != nil {
+		return nil, fmt.Errorf("key() first argument must be a string literal: %s", keyNameRaw)
+	}
+	expandedName := expandQName(keyName, namespaces)
+
+	// Second argument: value expression (kept as-is for runtime evaluation)
+	valueExpr := strings.TrimSpace(args[1])
+
+	return &KeyPattern{
+		KeyName:    expandedName,
+		ValueExpr:  valueExpr,
+		Namespaces: namespaces,
+	}, nil
+}
+
+// stripStringLiteral removes surrounding quotes from a string literal ('...' or "...").
+func stripStringLiteral(s string) (string, error) {
+	if len(s) >= 2 {
+		if (s[0] == '\'' && s[len(s)-1] == '\'') || (s[0] == '"' && s[len(s)-1] == '"') {
+			return s[1 : len(s)-1], nil
+		}
+	}
+	return "", fmt.Errorf("not a string literal: %s", s)
+}
+
 // splitTopLevelOn splits s on the given separator byte at the top level
-// (not inside [...] brackets or string literals).
+// (not inside [...] brackets, (...) parentheses, or string literals).
 func splitTopLevelOn(s string, sep byte) []string {
 	var parts []string
 	depth := 0
@@ -1456,9 +1707,9 @@ func splitTopLevelOn(s string, sep byte) []string {
 		case '\'', '"':
 			inStr = true
 			strCh = ch
-		case '[':
+		case '[', '(':
 			depth++
-		case ']':
+		case ']', ')':
 			if depth > 0 {
 				depth--
 			}
@@ -1490,9 +1741,9 @@ func containsTopLevel(s string, ch byte) bool {
 		case '\'', '"':
 			inStr = true
 			strCh = c
-		case '[':
+		case '[', '(':
 			depth++
-		case ']':
+		case ']', ')':
 			if depth > 0 {
 				depth--
 			}
@@ -1525,9 +1776,9 @@ func lastTopLevelSlash(s string) (int, bool) {
 		case '\'', '"':
 			inStr = true
 			strCh = ch
-		case '[':
+		case '[', '(':
 			depth++
-		case ']':
+		case ']', ')':
 			if depth > 0 {
 				depth--
 			}

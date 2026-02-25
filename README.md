@@ -23,12 +23,13 @@ A proof-of-concept XSLT processor written in Go.
 - `xsl:number` (single/multiple/any level, format patterns)
 - `xsl:message` (with terminate, custom message handler)
 - `xsl:result-document` (multiple output documents)
+- `xsl:analyze-string` with `xsl:matching-substring`/`xsl:non-matching-substring` and `regex-group()`
 - `xsl:map`, `xsl:map-entry` (XPath maps and arrays supported)
 - `xsl:function` (stylesheet functions callable from XPath)
 
 ### Stylesheet Structure
 
-- `xsl:output` (method, indent, version)
+- `xsl:output` (method, indent, version, omit-xml-declaration)
 - `xsl:import` and `xsl:include` (with precedence and cycle detection)
 - Stylesheet parameters (`xsl:param` at top level, passable via CLI or API)
 - Attribute Value Templates (`class="item-{@id}"`)
@@ -76,6 +77,22 @@ func main() {
     }
 }
 ```
+
+## W3C XSLT Test Suite
+
+To run the [W3C XSLT 3.0 conformance tests](https://github.com/w3c/xslt30-test), clone the test suite into `testdata/w3c/`:
+
+```
+git clone https://github.com/w3c/xslt30-test.git testdata/w3c
+```
+
+Then run:
+
+```
+go test -v -run TestW3C ./...
+```
+
+The directory is listed in `.gitignore`. If it is not present, the tests are skipped automatically.
 
 ## License
 

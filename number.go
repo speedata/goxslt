@@ -184,11 +184,24 @@ func elementParent(node goxml.XMLNode) goxml.XMLNode {
 // documentRoot walks up to the root document node.
 func documentRoot(node goxml.XMLNode) goxml.XMLNode {
 	for {
-		p := elementParent(node)
-		if p == nil {
+		switch n := node.(type) {
+		case *goxml.XMLDocument:
+			return n
+		case *goxml.Element:
+			if n.Parent != nil {
+				node = n.Parent
+				continue
+			}
+			return n
+		case *goxml.Attribute:
+			if n.Parent != nil {
+				node = n.Parent
+				continue
+			}
+			return n
+		default:
 			return node
 		}
-		node = p
 	}
 }
 

@@ -76,12 +76,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	var result string
-	if ss.Output.Indent {
-		result = goxslt.SerializeIndent(transformResult.Document, "  ")
-	} else {
-		result = goxslt.SerializeResult(transformResult.Document)
-	}
+	result := goxslt.SerializeWithOutput(transformResult.Document, transformResult.Output)
 
 	if outputPath != "" {
 		if err := os.WriteFile(outputPath, []byte(result), 0644); err != nil {
@@ -94,12 +89,7 @@ func main() {
 
 	// Write secondary documents (xsl:result-document).
 	for href, doc := range transformResult.SecondaryDocuments {
-		var secResult string
-		if ss.Output.Indent {
-			secResult = goxslt.SerializeIndent(doc, "  ")
-		} else {
-			secResult = goxslt.SerializeResult(doc)
-		}
+		secResult := goxslt.SerializeWithOutput(doc, transformResult.Output)
 		secPath := href
 		if outputPath != "" {
 			secPath = filepath.Join(filepath.Dir(outputPath), href)

@@ -1,6 +1,9 @@
 package goxslt
 
 import (
+	"strconv"
+	"strings"
+
 	"github.com/speedata/goxml"
 )
 
@@ -72,10 +75,19 @@ func (p *NodeKindTest) DefaultPriority() float64  { return -0.5 }
 
 type AnyNodeTest struct{}
 
-func (p *AnyNodeTest) Matches(node goxml.XMLNode, ctx *MatchContext) bool { return true }
-func (p *AnyNodeTest) Fingerprint() string                                { return "" }
-func (p *AnyNodeTest) MatchesNodeKind() NodeKind                          { return NodeGeneric }
-func (p *AnyNodeTest) DefaultPriority() float64                           { return -0.5 }
+func (p *AnyNodeTest) Matches(node goxml.XMLNode, ctx *MatchContext) bool {
+	// node() in a match pattern matches element, text, comment, PI — but NOT
+	// attributes, namespace nodes, or the document node.
+	switch node.(type) {
+	case *goxml.Attribute, *goxml.XMLDocument:
+		return false
+	default:
+		return true
+	}
+}
+func (p *AnyNodeTest) Fingerprint() string       { return "" }
+func (p *AnyNodeTest) MatchesNodeKind() NodeKind { return NodeGeneric }
+func (p *AnyNodeTest) DefaultPriority() float64  { return -0.5 }
 
 // --------------------------------------------------------------------------
 // WildcardTest — matches any element or any attribute (match="*")
@@ -172,17 +184,44 @@ func (p *PredicatePattern) Matches(node goxml.XMLNode, ctx *MatchContext) bool {
 	if !p.BasePattern.Matches(node, ctx) {
 		return false
 	}
-	if p.PredicateExpr != "" && ctx != nil && ctx.XPathEval != nil {
-		result, err := ctx.XPathEval(p.PredicateExpr, node)
-		if err != nil {
-			return false
+	if p.PredicateExpr != "" {
+		// Handle numeric positional predicates: [N] means position()=N
+		// among siblings that match the base pattern.
+		if pos, err := strconv.Atoi(strings.TrimSpace(p.PredicateExpr)); err == nil {
+			return positionAmongSiblings(node, p.BasePattern, ctx) == pos
 		}
-		return result
+		if ctx != nil && ctx.XPathEval != nil {
+			result, err := ctx.XPathEval(p.PredicateExpr, node)
+			if err != nil {
+				return false
+			}
+			return result
+		}
 	}
 	if p.PredicateFunc != nil {
 		return p.PredicateFunc(node, ctx)
 	}
 	return true
+}
+
+// positionAmongSiblings returns the 1-based position of node among its
+// parent's children that match the given pattern.
+func positionAmongSiblings(node goxml.XMLNode, base Pattern, ctx *MatchContext) int {
+	parent := parentOf(node)
+	if parent == nil {
+		return 1
+	}
+	nodeID := node.GetID()
+	pos := 0
+	for _, sibling := range parent.Children() {
+		if base.Matches(sibling, ctx) {
+			pos++
+			if sibling.GetID() == nodeID {
+				return pos
+			}
+		}
+	}
+	return 0
 }
 
 func (p *PredicatePattern) Fingerprint() string       { return p.BasePattern.Fingerprint() }
@@ -226,6 +265,36 @@ func (p *UnionPattern) MatchesNodeKind() NodeKind {
 }
 
 func (p *UnionPattern) DefaultPriority() float64 { return -0.5 }
+
+// --------------------------------------------------------------------------
+// KeyPattern — matches nodes that are in the result of a key() call
+// --------------------------------------------------------------------------
+
+// KeyPattern matches a node if it appears in the result of
+// key(KeyName, ValueExpr). Used for match="key('k', 'val')" patterns.
+type KeyPattern struct {
+	KeyName    string            // expanded key name
+	ValueExpr  string            // second argument (string literal or XPath expression)
+	Namespaces map[string]string // for XPath evaluation of ValueExpr
+}
+
+func (p *KeyPattern) Matches(node goxml.XMLNode, ctx *MatchContext) bool {
+	if ctx == nil || ctx.KeyLookup == nil {
+		return false
+	}
+	nodes := ctx.KeyLookup(p.KeyName, p.ValueExpr, p.Namespaces)
+	nodeID := node.GetID()
+	for _, n := range nodes {
+		if n.GetID() == nodeID {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *KeyPattern) Fingerprint() string       { return "" }
+func (p *KeyPattern) MatchesNodeKind() NodeKind { return NodeGeneric }
+func (p *KeyPattern) DefaultPriority() float64  { return 0.5 }
 
 // --------------------------------------------------------------------------
 // Helper
