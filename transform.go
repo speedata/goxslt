@@ -141,9 +141,10 @@ type keyIndex struct {
 
 // TransformOptions configures optional behavior for the transformation.
 type TransformOptions struct {
-	MessageHandler func(text string, terminate bool) // callback for xsl:message
-	MessageWriter  io.Writer                         // output for xsl:message (default os.Stderr)
-	Parameters     map[string]goxpath.Sequence       // stylesheet parameters (overrides xsl:param defaults)
+	MessageHandler  func(text string, terminate bool) // callback for xsl:message
+	MessageWriter   io.Writer                         // output for xsl:message (default os.Stderr)
+	Parameters      map[string]goxpath.Sequence       // stylesheet parameters (overrides xsl:param defaults)
+	InitialTemplate string                            // if set, call this named template instead of apply-templates on the document root
 }
 
 // Transform applies the compiled stylesheet to the source document and returns
@@ -157,6 +158,14 @@ func TransformWithOptions(ss *Stylesheet, sourceDoc *goxml.XMLDocument, opts Tra
 	resultDoc := &goxml.XMLDocument{}
 
 	xp := &goxpath.Parser{Ctx: goxpath.NewContext(sourceDoc)}
+
+	// Set baseURI so that doc() can resolve relative paths.
+	if ss.BasePath != "" {
+		if xp.Ctx.Store == nil {
+			xp.Ctx.Store = make(map[interface{}]interface{})
+		}
+		xp.Ctx.Store["baseURI"] = filepath.Join(ss.BasePath, "stylesheet.xsl")
+	}
 
 	matchCtx := &MatchContext{Namespaces: make(map[string]string)}
 
@@ -201,6 +210,7 @@ func TransformWithOptions(ss *Stylesheet, sourceDoc *goxml.XMLDocument, opts Tra
 	tc.registerKeyFunction(ss)
 	tc.registerDocumentFunction()
 	tc.registerIDFunction()
+	tc.registerUnparsedTextFunction()
 
 	// Process global params and variables in declaration order so that
 	// a param default can reference a preceding variable and vice versa.
@@ -348,9 +358,21 @@ func TransformWithOptions(ss *Stylesheet, sourceDoc *goxml.XMLDocument, opts Tra
 		})
 	}
 
-	// Start transformation: apply-templates to the document node.
-	if err := tc.ApplyTemplates(ss.DefaultMode, []goxml.XMLNode{sourceDoc}); err != nil {
-		return nil, err
+	// Start transformation.
+	if opts.InitialTemplate != "" {
+		// Call the named template directly.
+		tmpl, ok := ss.NamedTemplates[opts.InitialTemplate]
+		if !ok {
+			return nil, fmt.Errorf("initial-template: no template named '%s'", opts.InitialTemplate)
+		}
+		if err := tc.ExecuteTemplate(tmpl); err != nil {
+			return nil, err
+		}
+	} else {
+		// Default: apply-templates to the document node.
+		if err := tc.ApplyTemplates(ss.DefaultMode, []goxml.XMLNode{sourceDoc}); err != nil {
+			return nil, err
+		}
 	}
 
 	return &TransformResult{
@@ -487,21 +509,55 @@ func (instr *LiteralElement) Execute(ctx *TransformContext) error {
 }
 
 func (instr *LiteralText) Execute(ctx *TransformContext) error {
-	ctx.output().Append(goxml.CharData{Contents: instr.Text})
+	text := instr.Text
+	if instr.TVT != nil {
+		var err error
+		text, err = ctx.evalAVT(*instr.TVT)
+		if err != nil {
+			return fmt.Errorf("text value template: %w", err)
+		}
+	}
+	ctx.output().Append(goxml.CharData{Contents: text})
 	return nil
 }
 
 func (instr *XSLText) Execute(ctx *TransformContext) error {
-	ctx.output().Append(goxml.CharData{Contents: instr.Text})
+	text := instr.Text
+	if instr.TVT != nil {
+		var err error
+		text, err = ctx.evalAVT(*instr.TVT)
+		if err != nil {
+			return fmt.Errorf("xsl:text value template: %w", err)
+		}
+	}
+	ctx.output().Append(goxml.CharData{Contents: text})
 	return nil
 }
 
 func (instr *XSLValueOf) Execute(ctx *TransformContext) error {
-	result, err := ctx.evalXPath(instr.Select)
-	if err != nil {
-		return fmt.Errorf("xsl:value-of select='%s': %w", instr.Select, err)
+	var text string
+	if instr.Select != "" {
+		result, err := ctx.evalXPath(instr.Select)
+		if err != nil {
+			return fmt.Errorf("xsl:value-of select='%s': %w", instr.Select, err)
+		}
+		text = result.StringvalueJoin(instr.Separator)
+	} else if len(instr.Children) > 0 {
+		fragDoc := &goxml.XMLDocument{}
+		ctx.pushOutput(fragDoc)
+		for _, child := range instr.Children {
+			if err := child.Execute(ctx); err != nil {
+				ctx.popOutput()
+				return err
+			}
+		}
+		ctx.popOutput()
+		var sb strings.Builder
+		for _, child := range fragDoc.Children() {
+			sb.WriteString(nodeStringValue(child))
+		}
+		text = sb.String()
 	}
-	text := result.StringvalueJoin(instr.Separator)
 	if text != "" {
 		ctx.output().Append(goxml.CharData{Contents: text})
 	}
@@ -520,6 +576,9 @@ func (instr *XSLApplyTemplates) Execute(ctx *TransformContext) error {
 
 	if instr.Select == "" {
 		// Default: select child nodes of current node.
+		if ctx.CurrentNode == nil {
+			return nil
+		}
 		nodes = ctx.CurrentNode.Children()
 	} else {
 		result, err := ctx.evalXPath(instr.Select)
@@ -632,6 +691,43 @@ func (instr *XSLForEachGroup) Execute(ctx *TransformContext) error {
 			} else {
 				groups[len(groups)-1].nodes = append(groups[len(groups)-1].nodes, node)
 			}
+		}
+	} else if instr.GroupEndingPat != nil {
+		// group-ending-with: current node ends the current group when it matches.
+		for _, node := range nodes {
+			if len(groups) == 0 {
+				groups = append(groups, group{nodes: []goxml.XMLNode{node}})
+			} else {
+				groups[len(groups)-1].nodes = append(groups[len(groups)-1].nodes, node)
+			}
+			if instr.GroupEndingPat.Matches(node, ctx.MatchCtx) {
+				// Start a new group after this node.
+				groups = append(groups, group{})
+			}
+		}
+		// Remove trailing empty group.
+		if len(groups) > 0 && len(groups[len(groups)-1].nodes) == 0 {
+			groups = groups[:len(groups)-1]
+		}
+	} else if instr.GroupAdjacent != "" {
+		// group-adjacent: group consecutive nodes with the same key.
+		var prevKey string
+		for _, node := range nodes {
+			prevNode := ctx.CurrentNode
+			ctx.CurrentNode = node
+			keyResult, err := ctx.evalXPath(instr.GroupAdjacent)
+			ctx.CurrentNode = prevNode
+			if err != nil {
+				return fmt.Errorf("xsl:for-each-group group-adjacent='%s': %w", instr.GroupAdjacent, err)
+			}
+			key := keyResult.Stringvalue()
+
+			if len(groups) == 0 || key != prevKey {
+				groups = append(groups, group{key: key, nodes: []goxml.XMLNode{node}})
+			} else {
+				groups[len(groups)-1].nodes = append(groups[len(groups)-1].nodes, node)
+			}
+			prevKey = key
 		}
 	} else {
 		// group-by: group by evaluated key expression.
@@ -1279,8 +1375,15 @@ func (instr *XSLResultDocument) Execute(ctx *TransformContext) error {
 	if err != nil {
 		return fmt.Errorf("xsl:result-document href: %w", err)
 	}
+
+	// If href is empty (no href attribute), write to the primary output.
 	if href == "" {
-		return fmt.Errorf("xsl:result-document: href is empty")
+		for _, child := range instr.Children {
+			if err := child.Execute(ctx); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 
 	secDoc := &goxml.XMLDocument{}
@@ -1294,6 +1397,223 @@ func (instr *XSLResultDocument) Execute(ctx *TransformContext) error {
 	ctx.popOutput()
 
 	ctx.SecondaryDocuments[href] = secDoc
+	return nil
+}
+
+// Execute implements xsl:source-document by loading the document referenced
+// by href and executing the children with that document as context node.
+func (instr *XSLSourceDocument) Execute(ctx *TransformContext) error {
+	href, err := ctx.evalAVT(instr.Href)
+	if err != nil {
+		return fmt.Errorf("xsl:source-document href: %w", err)
+	}
+	if href == "" {
+		return fmt.Errorf("xsl:source-document: href is empty")
+	}
+
+	doc, err := ctx.loadDocument(href)
+	if err != nil {
+		return fmt.Errorf("xsl:source-document href='%s': %w", href, err)
+	}
+
+	// Save current context.
+	prevNode := ctx.CurrentNode
+	prevItem := ctx.CurrentItem
+	prevPos := ctx.XPath.Ctx.Pos
+	prevSize := ctx.XPath.Ctx.Size()
+	prevSeq := ctx.XPath.Ctx.GetContextSequence()
+
+	// Set loaded document as context.
+	ctx.CurrentNode = doc
+	ctx.CurrentItem = nil
+	ctx.XPath.Ctx.SetContextSequence(goxpath.Sequence{doc})
+	ctx.XPath.Ctx.Pos = 1
+	ctx.XPath.Ctx.SetSize(1)
+
+	// Execute children.
+	for _, child := range instr.Children {
+		if err := child.Execute(ctx); err != nil {
+			ctx.CurrentNode = prevNode
+			ctx.CurrentItem = prevItem
+			ctx.XPath.Ctx.SetContextSequence(prevSeq)
+			ctx.XPath.Ctx.Pos = prevPos
+			ctx.XPath.Ctx.SetSize(prevSize)
+			return err
+		}
+	}
+
+	// Restore context.
+	ctx.CurrentNode = prevNode
+	ctx.CurrentItem = prevItem
+	ctx.XPath.Ctx.SetContextSequence(prevSeq)
+	ctx.XPath.Ctx.Pos = prevPos
+	ctx.XPath.Ctx.SetSize(prevSize)
+	return nil
+}
+
+// Execute implements xsl:try by executing the try body and catching errors.
+func (instr *XSLTry) Execute(ctx *TransformContext) error {
+	var tryErr error
+	if instr.Select != "" {
+		result, err := ctx.evalXPath(instr.Select)
+		if err != nil {
+			tryErr = err
+		} else {
+			text := result.Stringvalue()
+			if text != "" {
+				ctx.output().Append(goxml.CharData{Contents: text})
+			}
+		}
+	} else {
+		for _, child := range instr.Children {
+			if err := child.Execute(ctx); err != nil {
+				tryErr = err
+				break
+			}
+		}
+	}
+
+	if tryErr == nil {
+		return nil
+	}
+
+	// Find matching catch clause.
+	for _, catch := range instr.Catches {
+		if catch.Errors == "*" || catchMatchesError(catch.Errors, tryErr) {
+			return catch.execute(ctx)
+		}
+	}
+
+	// No matching catch — propagate the error.
+	return tryErr
+}
+
+func catchMatchesError(errors string, err error) bool {
+	errMsg := err.Error()
+	for _, code := range strings.Fields(errors) {
+		if code == "*" || strings.Contains(errMsg, code) {
+			return true
+		}
+	}
+	return false
+}
+
+func (catch *XSLCatch) execute(ctx *TransformContext) error {
+	if catch.Select != "" {
+		result, err := ctx.evalXPath(catch.Select)
+		if err != nil {
+			return fmt.Errorf("xsl:catch select='%s': %w", catch.Select, err)
+		}
+		text := result.Stringvalue()
+		if text != "" {
+			ctx.output().Append(goxml.CharData{Contents: text})
+		}
+		return nil
+	}
+	for _, child := range catch.Children {
+		if err := child.Execute(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Execute implements xsl:where-populated: execute children into a temporary
+// document, include output only if non-empty.
+func (instr *XSLWherePopulated) Execute(ctx *TransformContext) error {
+	fragDoc := &goxml.XMLDocument{}
+	ctx.pushOutput(fragDoc)
+	for _, child := range instr.Children {
+		if err := child.Execute(ctx); err != nil {
+			ctx.popOutput()
+			return err
+		}
+	}
+	ctx.popOutput()
+
+	// Only append children if there is non-empty content.
+	children := fragDoc.Children()
+	if len(children) == 0 {
+		return nil
+	}
+	for _, child := range children {
+		ctx.output().Append(child)
+	}
+	return nil
+}
+
+// Execute implements xsl:on-empty. For now, this is a simplified version
+// that just executes the children (proper empty-detection requires parent context).
+func (instr *XSLOnEmpty) Execute(ctx *TransformContext) error {
+	// Simplified: always execute. Full implementation would check
+	// if the parent's output is empty.
+	for _, child := range instr.Children {
+		if err := child.Execute(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Execute implements xsl:on-non-empty. For now, this is a simplified version.
+func (instr *XSLOnNonEmpty) Execute(ctx *TransformContext) error {
+	for _, child := range instr.Children {
+		if err := child.Execute(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Execute implements a generic sequence constructor.
+func (instr *XSLSequenceConstructor) Execute(ctx *TransformContext) error {
+	for _, child := range instr.Children {
+		if err := child.Execute(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Execute implements xsl:namespace by adding a namespace declaration to the
+// current output element.
+func (instr *XSLNamespace) Execute(ctx *TransformContext) error {
+	prefix, err := ctx.evalAVT(instr.Name)
+	if err != nil {
+		return fmt.Errorf("xsl:namespace name: %w", err)
+	}
+
+	var uri string
+	if instr.Select != "" {
+		result, err := ctx.evalXPath(instr.Select)
+		if err != nil {
+			return fmt.Errorf("xsl:namespace select='%s': %w", instr.Select, err)
+		}
+		uri = result.Stringvalue()
+	} else if len(instr.Children) > 0 {
+		fragDoc := &goxml.XMLDocument{}
+		ctx.pushOutput(fragDoc)
+		for _, child := range instr.Children {
+			if err := child.Execute(ctx); err != nil {
+				ctx.popOutput()
+				return err
+			}
+		}
+		ctx.popOutput()
+		var sb strings.Builder
+		for _, child := range fragDoc.Children() {
+			sb.WriteString(nodeStringValue(child))
+		}
+		uri = sb.String()
+	}
+
+	// Add namespace to current output element.
+	if elt, ok := ctx.output().(*goxml.Element); ok {
+		if elt.Namespaces == nil {
+			elt.Namespaces = make(map[string]string)
+		}
+		elt.Namespaces[prefix] = uri
+	}
 	return nil
 }
 
@@ -1326,6 +1646,9 @@ func (tc *TransformContext) evalAVT(avt AVT) (string, error) {
 // --------------------------------------------------------------------------
 
 func (instr *XSLCopy) Execute(ctx *TransformContext) error {
+	if ctx.CurrentNode == nil {
+		return nil
+	}
 	switch n := ctx.CurrentNode.(type) {
 	case *goxml.Element:
 		elt := goxml.NewElement()
@@ -1399,11 +1722,22 @@ func (instr *XSLAttribute) Execute(ctx *TransformContext) error {
 		value = sb.String()
 	}
 
-	elt, ok := ctx.output().(*goxml.Element)
-	if !ok {
-		return fmt.Errorf("xsl:attribute '%s': output is not an element (%T)", name, ctx.output())
+	output := ctx.output()
+	switch o := output.(type) {
+	case *goxml.Element:
+		o.SetAttribute(xml.Attr{Name: xml.Name{Local: name}, Value: value})
+	case *goxml.XMLDocument:
+		// If the output is a document, try to find the last element child.
+		for i := len(o.Children()) - 1; i >= 0; i-- {
+			if elt, ok := o.Children()[i].(*goxml.Element); ok {
+				elt.SetAttribute(xml.Attr{Name: xml.Name{Local: name}, Value: value})
+				return nil
+			}
+		}
+		return fmt.Errorf("xsl:attribute '%s': output is not an element (%T)", name, output)
+	default:
+		return fmt.Errorf("xsl:attribute '%s': output is not an element (%T)", name, output)
 	}
-	elt.SetAttribute(xml.Attr{Name: xml.Name{Local: name}, Value: value})
 	return nil
 }
 
@@ -1447,12 +1781,27 @@ func (instr *XSLCallTemplate) Execute(ctx *TransformContext) error {
 	// Set template parameters: with-param overrides, then defaults.
 	for _, p := range tmpl.Params {
 		if val, ok := paramValues[p.Name]; ok {
+			if p.As != nil {
+				var coerceErr error
+				val, coerceErr = coerceSequence(p.As, val)
+				if coerceErr != nil {
+					ctx.XPath.Ctx = origCtx
+					return fmt.Errorf("xsl:param name='%s': %w", p.Name, coerceErr)
+				}
+			}
 			ctx.XPath.SetVariable(p.Name, val)
 		} else {
 			val, err := evalParamValue(ctx, p.Select, p.Children)
 			if err != nil {
 				ctx.XPath.Ctx = origCtx
 				return fmt.Errorf("xsl:param name='%s' default: %w", p.Name, err)
+			}
+			if p.As != nil {
+				val, err = coerceSequence(p.As, val)
+				if err != nil {
+					ctx.XPath.Ctx = origCtx
+					return fmt.Errorf("xsl:param name='%s': %w", p.Name, err)
+				}
 			}
 			ctx.XPath.SetVariable(p.Name, val)
 		}
@@ -1634,6 +1983,53 @@ func (b *TextOnlyCopyRuleSet) Process(node goxml.XMLNode, ctx *TransformContext)
 		ctx.output().Append(goxml.CharData{Contents: n.Value})
 	case goxml.Comment, goxml.ProcInst:
 		// do nothing
+	}
+	return nil
+}
+
+// --------------------------------------------------------------------------
+// ShallowCopyRuleSet — built-in rules for on-no-match="shallow-copy"
+// --------------------------------------------------------------------------
+
+type ShallowCopyRuleSet struct{}
+
+func (b *ShallowCopyRuleSet) Process(node goxml.XMLNode, ctx *TransformContext) error {
+	switch n := node.(type) {
+	case *goxml.XMLDocument:
+		return ctx.ApplyTemplates(ctx.CurrentMode, n.Children())
+	case *goxml.Element:
+		elt := goxml.NewElement()
+		elt.Name = n.Name
+		elt.Prefix = n.Prefix
+		for k, v := range n.Namespaces {
+			elt.Namespaces[k] = v
+		}
+		ctx.output().Append(elt)
+		ctx.pushOutput(elt)
+		// Apply templates to attributes and children.
+		attrs := n.Attributes()
+		children := n.Children()
+		nodes := make([]goxml.XMLNode, 0, len(attrs)+len(children))
+		for _, a := range attrs {
+			nodes = append(nodes, a)
+		}
+		nodes = append(nodes, children...)
+		err := ctx.ApplyTemplates(ctx.CurrentMode, nodes)
+		ctx.popOutput()
+		return err
+	case goxml.CharData:
+		ctx.output().Append(goxml.CharData{Contents: n.Contents})
+	case *goxml.Attribute:
+		if elt, ok := ctx.output().(*goxml.Element); ok {
+			elt.SetAttribute(xml.Attr{
+				Name:  xml.Name{Local: n.Name, Space: n.Namespace},
+				Value: n.Value,
+			})
+		}
+	case goxml.Comment:
+		ctx.output().Append(goxml.Comment{Contents: n.Contents})
+	case goxml.ProcInst:
+		ctx.output().Append(goxml.ProcInst{Target: n.Target, Inst: n.Inst})
 	}
 	return nil
 }
@@ -1900,6 +2296,60 @@ func walkNodes(node goxml.XMLNode, fn func(goxml.XMLNode)) {
 	for _, child := range node.Children() {
 		walkNodes(child, fn)
 	}
+}
+
+// registerUnparsedTextFunction registers the XSLT-only unparsed-text() and
+// unparsed-text-available() functions. These resolve relative URIs against
+// the stylesheet base path.
+func (tc *TransformContext) registerUnparsedTextFunction() {
+	basePath := tc.Stylesheet.BasePath
+
+	goxpath.RegisterFunction(&goxpath.Function{
+		Name:      "unparsed-text",
+		Namespace: nsFN,
+		MinArg:    1,
+		MaxArg:    2,
+		F: func(xpCtx *goxpath.Context, args []goxpath.Sequence) (goxpath.Sequence, error) {
+			href, err := goxpath.StringValue(args[0])
+			if err != nil {
+				return nil, fmt.Errorf("unparsed-text: %w", err)
+			}
+			if href == "" {
+				return goxpath.Sequence{""}, nil
+			}
+			resolvedPath := href
+			if !filepath.IsAbs(href) && basePath != "" {
+				resolvedPath = filepath.Join(basePath, href)
+			}
+			data, err := os.ReadFile(resolvedPath)
+			if err != nil {
+				return nil, fmt.Errorf("unparsed-text: %w", err)
+			}
+			return goxpath.Sequence{string(data)}, nil
+		},
+	})
+
+	goxpath.RegisterFunction(&goxpath.Function{
+		Name:      "unparsed-text-available",
+		Namespace: nsFN,
+		MinArg:    1,
+		MaxArg:    2,
+		F: func(xpCtx *goxpath.Context, args []goxpath.Sequence) (goxpath.Sequence, error) {
+			href, err := goxpath.StringValue(args[0])
+			if err != nil {
+				return goxpath.Sequence{false}, nil
+			}
+			if href == "" {
+				return goxpath.Sequence{false}, nil
+			}
+			resolvedPath := href
+			if !filepath.IsAbs(href) && basePath != "" {
+				resolvedPath = filepath.Join(basePath, href)
+			}
+			_, err = os.Stat(resolvedPath)
+			return goxpath.Sequence{err == nil}, nil
+		},
+	})
 }
 
 // --------------------------------------------------------------------------

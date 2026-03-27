@@ -88,6 +88,17 @@ func parseSequenceType(s string) (*SequenceType, error) {
 			st.Item = ItemTypeMap
 		} else if strings.HasPrefix(s, "array(") && strings.HasSuffix(s, ")") {
 			st.Item = ItemTypeArray
+		} else if strings.HasPrefix(s, "element(") || strings.HasPrefix(s, "attribute(") {
+			// Accept element(...) and attribute(...) leniently as generic item().
+			st.Item = ItemTypeItem
+		} else if strings.HasPrefix(s, "function(") {
+			// Accept function(...) leniently.
+			st.Item = ItemTypeItem
+		} else if s == "text()" || s == "comment()" || s == "processing-instruction()" || s == "document-node()" || s == "namespace-node()" {
+			st.Item = ItemTypeNode
+		} else if strings.HasPrefix(s, "xs:") || strings.HasPrefix(s, "Q{") {
+			// Accept other xs:* types and EQName types leniently.
+			st.Item = ItemTypeItem
 		} else {
 			return nil, fmt.Errorf("unsupported sequence type: %s", s)
 		}
@@ -167,6 +178,14 @@ func coerceItem(typ ItemType, item any) (any, error) {
 	case ItemTypeElement:
 		if _, ok := item.(*goxml.Element); ok {
 			return item, nil
+		}
+		// If given a document node, extract the root element.
+		if doc, ok := item.(*goxml.XMLDocument); ok {
+			for _, child := range doc.Children() {
+				if elt, ok := child.(*goxml.Element); ok {
+					return elt, nil
+				}
+			}
 		}
 		return nil, fmt.Errorf("expected element(), got %T", item)
 

@@ -36,15 +36,18 @@ type LiteralAttribute struct {
 }
 
 // LiteralText writes text to the result tree.
+// When TVT is non-nil, the text is evaluated as a Text Value Template.
 type LiteralText struct {
 	Text string
+	TVT  *AVT // non-nil when expand-text is active
 }
 
-// XSLValueOf evaluates an XPath expression and writes the string value to the
-// result tree. Corresponds to <xsl:value-of select="..."/>.
+// XSLValueOf evaluates an XPath expression or its child sequence constructor
+// and writes the string value to the result tree.
 type XSLValueOf struct {
-	Select    string // XPath expression
-	Separator string // item separator (default: single space in XSLT 2.0+)
+	Select    string        // XPath expression (optional if Children is set)
+	Children  []Instruction // sequence constructor (used when Select is empty)
+	Separator string        // item separator (default: single space in XSLT 2.0+)
 }
 
 // XSLApplyTemplates selects nodes via an XPath expression and applies
@@ -79,8 +82,10 @@ type XSLCopyOf struct {
 
 // XSLText writes literal text to the result tree.
 // Corresponds to <xsl:text>...</xsl:text>.
+// When TVT is non-nil, the text is evaluated as a Text Value Template.
 type XSLText struct {
 	Text string
+	TVT  *AVT // non-nil when expand-text is active
 }
 
 // XSLChoose implements conditional processing with multiple branches.
@@ -197,7 +202,9 @@ type XSLMapEntry struct {
 type XSLForEachGroup struct {
 	Select           string        // XPath expression selecting the population
 	GroupBy          string        // XPath expression for grouping key
+	GroupAdjacent    string        // XPath expression for adjacent grouping key
 	GroupStartingPat Pattern       // compiled pattern for group-starting-with
+	GroupEndingPat   Pattern       // compiled pattern for group-ending-with
 	Sorts            []SortKey     // optional sort keys
 	Children         []Instruction // body to execute per group
 }
@@ -206,6 +213,55 @@ type XSLForEachGroup struct {
 // Corresponds to <xsl:result-document href="...">.
 type XSLResultDocument struct {
 	Href     AVT
+	Children []Instruction
+}
+
+// XSLSourceDocument loads an external document and executes its body with
+// that document as the context node.
+// Corresponds to <xsl:source-document href="..." streamable="yes|no">.
+type XSLSourceDocument struct {
+	Href     AVT
+	Children []Instruction
+}
+
+// XSLTry executes a sequence constructor and catches dynamic errors.
+type XSLTry struct {
+	Children []Instruction // try body
+	Catches  []XSLCatch    // xsl:catch clauses
+	Select   string        // optional select expression (alternative to Children)
+}
+
+// XSLCatch handles errors caught by xsl:try.
+type XSLCatch struct {
+	Errors   string        // space-separated error QNames or "*" (default: "*")
+	Children []Instruction // catch body
+	Select   string        // optional select expression
+}
+
+// XSLWherePopulated executes children and includes output only if non-empty.
+type XSLWherePopulated struct {
+	Children []Instruction
+}
+
+// XSLOnEmpty provides fallback content when the parent sequence is empty.
+type XSLOnEmpty struct {
+	Children []Instruction
+}
+
+// XSLOnNonEmpty provides content only when the parent sequence is non-empty.
+type XSLOnNonEmpty struct {
+	Children []Instruction
+}
+
+// XSLSequenceConstructor is a generic wrapper for a sequence of instructions.
+type XSLSequenceConstructor struct {
+	Children []Instruction
+}
+
+// XSLNamespace creates a namespace node on the current output element.
+type XSLNamespace struct {
+	Name     AVT
+	Select   string
 	Children []Instruction
 }
 

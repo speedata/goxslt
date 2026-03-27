@@ -2788,3 +2788,116 @@ func TestKeyUsedInPredicate(t *testing.T) {
 		t.Errorf("expected <out>Second</out>, got %s", result)
 	}
 }
+
+// transformHelper compiles an XSLT stylesheet and transforms the source XML,
+// returning the serialized result.
+func transformHelper(t *testing.T, sourceXML, xsltStr string) string {
+	t.Helper()
+	sourceDoc, err := goxml.Parse(strings.NewReader(sourceXML))
+	if err != nil {
+		t.Fatal("parsing source:", err)
+	}
+	xsltDoc, err := goxml.Parse(strings.NewReader(xsltStr))
+	if err != nil {
+		t.Fatal("parsing XSLT:", err)
+	}
+	ss, err := Compile(xsltDoc)
+	if err != nil {
+		t.Fatal("compiling XSLT:", err)
+	}
+	result, err := Transform(ss, sourceDoc)
+	if err != nil {
+		t.Fatal("transforming:", err)
+	}
+	return SerializeResult(result.Document)
+}
+
+// ========== expand-text / Text Value Templates ==========
+
+func TestExpandTextBasic(t *testing.T) {
+	result := transformHelper(t,
+		`<root><item name="Alice"/><item name="Bob"/></root>`,
+		`<xsl:stylesheet version="3.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+		  expand-text="yes">
+  <xsl:template match="root">
+    <out><xsl:apply-templates/></out>
+  </xsl:template>
+  <xsl:template match="item">Hello {./@name}! </xsl:template>
+</xsl:stylesheet>`)
+	if !strings.Contains(result, "Hello Alice!") {
+		t.Errorf("expected 'Hello Alice!', got %s", result)
+	}
+	if !strings.Contains(result, "Hello Bob!") {
+		t.Errorf("expected 'Hello Bob!', got %s", result)
+	}
+}
+
+func TestExpandTextLiteralElement(t *testing.T) {
+	result := transformHelper(t,
+		`<data><val>42</val></data>`,
+		`<xsl:stylesheet version="3.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+		  expand-text="yes">
+  <xsl:template match="data">
+    <out>The value is {val}.</out>
+  </xsl:template>
+</xsl:stylesheet>`)
+	if !strings.Contains(result, "The value is 42.") {
+		t.Errorf("expected 'The value is 42.', got %s", result)
+	}
+}
+
+func TestExpandTextXslText(t *testing.T) {
+	result := transformHelper(t,
+		`<data><x>7</x></data>`,
+		`<xsl:stylesheet version="3.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+		  expand-text="yes">
+  <xsl:template match="data">
+    <out><xsl:text>x={x}</xsl:text></out>
+  </xsl:template>
+</xsl:stylesheet>`)
+	if !strings.Contains(result, "x=7") {
+		t.Errorf("expected 'x=7', got %s", result)
+	}
+}
+
+func TestExpandTextEscapedBraces(t *testing.T) {
+	result := transformHelper(t,
+		`<data/>`,
+		`<xsl:stylesheet version="3.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+		  expand-text="yes">
+  <xsl:template match="data">
+    <out>A {{literal}} brace</out>
+  </xsl:template>
+</xsl:stylesheet>`)
+	if !strings.Contains(result, "A {literal} brace") {
+		t.Errorf("expected 'A {literal} brace', got %s", result)
+	}
+}
+
+func TestExpandTextDisabledByDefault(t *testing.T) {
+	result := transformHelper(t,
+		`<data><x>7</x></data>`,
+		`<xsl:stylesheet version="3.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+  <xsl:template match="data">
+    <out>no expansion {x} here</out>
+  </xsl:template>
+</xsl:stylesheet>`)
+	if !strings.Contains(result, "no expansion {x} here") {
+		t.Errorf("expected literal braces preserved, got %s", result)
+	}
+}
+
+func TestExpandTextLocalOverride(t *testing.T) {
+	result := transformHelper(t,
+		`<data><x>7</x></data>`,
+		`<xsl:stylesheet version="3.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+		  xmlns:xsle="http://www.w3.org/1999/XSL/Transform"
+		  expand-text="yes">
+  <xsl:template match="data">
+    <out xsle:expand-text="no">not expanded {x} here</out>
+  </xsl:template>
+</xsl:stylesheet>`)
+	if !strings.Contains(result, "not expanded {x} here") {
+		t.Errorf("expected expand-text=no to disable TVT, got %s", result)
+	}
+}

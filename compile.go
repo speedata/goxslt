@@ -19,6 +19,7 @@ type compileContext struct {
 	precedence int             // current import precedence level
 	visited    map[string]bool // absolute paths → cycle detection
 	basePath   string          // directory for resolving relative hrefs
+	expandText bool            // current expand-text setting (XSLT 3.0 TVT)
 }
 
 // Compile parses an XSLT stylesheet (already parsed as a goxml document) and
@@ -137,6 +138,11 @@ func (cc *compileContext) compileStylesheet(xsltDoc *goxml.XMLDocument) error {
 		return fmt.Errorf("XSLT: root element is %s, expected stylesheet or transform", root.Name)
 	}
 
+	// Read expand-text from root element (XSLT 3.0 Text Value Templates).
+	if attrValue(root, "expand-text") == "yes" {
+		cc.expandText = true
+	}
+
 	// Copy namespace declarations from the root element so that
 	// functions and XPath expressions can resolve prefixes.
 	for prefix, uri := range root.Namespaces {
@@ -241,7 +247,7 @@ func (cc *compileContext) compileStylesheet(xsltDoc *goxml.XMLDocument) error {
 			var children []Instruction
 			if sel == "" {
 				var err error
-				children, err = compileChildren(elt, cc.ss.Namespaces)
+				children, err = compileChildren(elt, cc.expandText, cc.ss.Namespaces)
 				if err != nil {
 					return err
 				}
@@ -297,6 +303,28 @@ func (cc *compileContext) compileStylesheet(xsltDoc *goxml.XMLDocument) error {
 				}
 			}
 			cc.ss.Keys = append(cc.ss.Keys, KeyDefinition{Name: expandedName, Match: pat, Use: use, Composite: composite})
+		case "mode":
+			name := attrValue(elt, "name")
+			onNoMatch := attrValue(elt, "on-no-match")
+			// Determine built-in rule set.
+			var builtIn BuiltInRuleSet
+			switch onNoMatch {
+			case "shallow-copy":
+				builtIn = &ShallowCopyRuleSet{}
+			default:
+				builtIn = &TextOnlyCopyRuleSet{}
+			}
+			// Get or create the mode.
+			if name == "" || name == "#default" || name == "#unnamed" {
+				cc.ss.DefaultMode.BuiltInRules = builtIn
+			} else {
+				if m, ok := cc.ss.Modes[name]; ok {
+					m.BuiltInRules = builtIn
+				} else {
+					m := NewMode(name, builtIn)
+					cc.ss.Modes[name] = m
+				}
+			}
 		}
 	}
 
@@ -425,7 +453,7 @@ func (cc *compileContext) compileTemplate(elt *goxml.Element) error {
 		return fmt.Errorf("XSLT: xsl:template has neither match nor name attribute (line %d)", elt.Line)
 	}
 
-	body, err := compileTemplateBody(elt, cc.ss.Namespaces)
+	body, err := compileTemplateBody(elt, cc.expandText, cc.ss.Namespaces)
 	if err != nil {
 		return err
 	}
@@ -474,7 +502,8 @@ func (cc *compileContext) compileTemplate(elt *goxml.Element) error {
 }
 
 // compileChildren compiles the children of an XSLT element into instructions.
-func compileChildren(parent *goxml.Element, namespaces ...map[string]string) ([]Instruction, error) {
+// expandText controls whether text nodes are parsed as Text Value Templates.
+func compileChildren(parent *goxml.Element, expandText bool, namespaces ...map[string]string) ([]Instruction, error) {
 	var ns map[string]string
 	if len(namespaces) > 0 {
 		ns = namespaces[0]
@@ -489,12 +518,20 @@ func compileChildren(parent *goxml.Element, namespaces ...map[string]string) ([]
 			if strings.TrimSpace(text) == "" {
 				continue
 			}
-			instructions = append(instructions, &LiteralText{Text: text})
+			lt := &LiteralText{Text: text}
+			if expandText {
+				avt, err := parseAVT(text)
+				if err != nil {
+					return nil, fmt.Errorf("XSLT: error in text value template: %w", err)
+				}
+				lt.TVT = &avt
+			}
+			instructions = append(instructions, lt)
 
 		case *goxml.Element:
 			childNS := n.Namespaces[n.Prefix]
 			if childNS == xslNS {
-				instr, err := compileXSLInstruction(n, ns)
+				instr, err := compileXSLInstruction(n, expandText, ns)
 				if err != nil {
 					return nil, err
 				}
@@ -503,7 +540,7 @@ func compileChildren(parent *goxml.Element, namespaces ...map[string]string) ([]
 				}
 			} else {
 				// Literal result element.
-				instr, err := compileLiteralElement(n, ns)
+				instr, err := compileLiteralElement(n, expandText, ns)
 				if err != nil {
 					return nil, err
 				}
@@ -515,7 +552,11 @@ func compileChildren(parent *goxml.Element, namespaces ...map[string]string) ([]
 	return instructions, nil
 }
 
-func compileXSLInstruction(elt *goxml.Element, namespaces map[string]string) (Instruction, error) {
+func compileXSLInstruction(elt *goxml.Element, expandText bool, namespaces map[string]string) (Instruction, error) {
+	// Any XSL element can override expand-text for its subtree.
+	if et := attrValue(elt, "expand-text"); et != "" {
+		expandText = et == "yes"
+	}
 	switch elt.Name {
 	case "apply-templates":
 		sel := attrValue(elt, "select")
@@ -542,7 +583,7 @@ func compileXSLInstruction(elt *goxml.Element, namespaces map[string]string) (In
 			var children []Instruction
 			if wpsel == "" {
 				var err error
-				children, err = compileChildren(childElt, namespaces)
+				children, err = compileChildren(childElt, expandText, namespaces)
 				if err != nil {
 					return nil, err
 				}
@@ -553,8 +594,13 @@ func compileXSLInstruction(elt *goxml.Element, namespaces map[string]string) (In
 
 	case "value-of":
 		sel := attrValue(elt, "select")
+		var children []Instruction
 		if sel == "" {
-			return nil, fmt.Errorf("XSLT: xsl:value-of missing select attribute (line %d)", elt.Line)
+			var err error
+			children, err = compileChildren(elt, expandText, namespaces)
+			if err != nil {
+				return nil, err
+			}
 		}
 		sep := " " // XSLT 2.0+ default separator
 		for _, attr := range elt.Attributes() {
@@ -563,7 +609,7 @@ func compileXSLInstruction(elt *goxml.Element, namespaces map[string]string) (In
 				break
 			}
 		}
-		return &XSLValueOf{Select: sel, Separator: sep}, nil
+		return &XSLValueOf{Select: sel, Children: children, Separator: sep}, nil
 
 	case "for-each":
 		sel := attrValue(elt, "select")
@@ -574,7 +620,7 @@ func compileXSLInstruction(elt *goxml.Element, namespaces map[string]string) (In
 		if err != nil {
 			return nil, err
 		}
-		children, err := compileChildren(elt, namespaces)
+		children, err := compileChildren(elt, expandText, namespaces)
 		if err != nil {
 			return nil, err
 		}
@@ -585,20 +631,34 @@ func compileXSLInstruction(elt *goxml.Element, namespaces map[string]string) (In
 		if test == "" {
 			return nil, fmt.Errorf("XSLT: xsl:if missing test attribute (line %d)", elt.Line)
 		}
-		children, err := compileChildren(elt, namespaces)
+		children, err := compileChildren(elt, expandText, namespaces)
 		if err != nil {
 			return nil, err
 		}
 		return &XSLIf{Test: test, Children: children}, nil
 
 	case "text":
+		// xsl:text can have its own expand-text attribute
+		localExpand := expandText
+		if et := attrValue(elt, "expand-text"); et != "" {
+			localExpand = et == "yes"
+		}
 		var sb strings.Builder
 		for _, child := range elt.Children() {
 			if cd, ok := child.(goxml.CharData); ok {
 				sb.WriteString(cd.Contents)
 			}
 		}
-		return &XSLText{Text: sb.String()}, nil
+		text := sb.String()
+		xslText := &XSLText{Text: text}
+		if localExpand {
+			avt, err := parseAVT(text)
+			if err != nil {
+				return nil, fmt.Errorf("XSLT: error in xsl:text value template: %w", err)
+			}
+			xslText.TVT = &avt
+		}
+		return xslText, nil
 
 	case "copy-of":
 		sel := attrValue(elt, "select")
@@ -608,23 +668,23 @@ func compileXSLInstruction(elt *goxml.Element, namespaces map[string]string) (In
 		return &XSLCopyOf{Select: sel}, nil
 
 	case "choose":
-		return compileChoose(elt, namespaces)
+		return compileChoose(elt, expandText, namespaces)
 
 	case "variable", "param":
-		return compileVariable(elt)
+		return compileVariable(elt, expandText)
 
 	case "copy":
-		children, err := compileChildren(elt, namespaces)
+		children, err := compileChildren(elt, expandText, namespaces)
 		if err != nil {
 			return nil, err
 		}
 		return &XSLCopy{Children: children}, nil
 
 	case "attribute":
-		return compileAttribute(elt, namespaces)
+		return compileAttribute(elt, expandText, namespaces)
 
 	case "call-template":
-		return compileCallTemplate(elt, namespaces)
+		return compileCallTemplate(elt, expandText, namespaces)
 
 	case "sequence":
 		sel := attrValue(elt, "select")
@@ -634,22 +694,22 @@ func compileXSLInstruction(elt *goxml.Element, namespaces map[string]string) (In
 		return &XSLSequence{Select: sel}, nil
 
 	case "element":
-		return compileElement(elt, namespaces)
+		return compileElement(elt, expandText, namespaces)
 
 	case "comment":
-		return compileComment(elt, namespaces)
+		return compileComment(elt, expandText, namespaces)
 
 	case "processing-instruction":
-		return compileProcessingInstruction(elt, namespaces)
+		return compileProcessingInstruction(elt, expandText, namespaces)
 
 	case "message":
-		return compileMessage(elt, namespaces)
+		return compileMessage(elt, expandText, namespaces)
 
 	case "number":
 		return compileNumber(elt, namespaces)
 
 	case "map":
-		children, err := compileChildren(elt, namespaces)
+		children, err := compileChildren(elt, expandText, namespaces)
 		if err != nil {
 			return nil, err
 		}
@@ -664,7 +724,7 @@ func compileXSLInstruction(elt *goxml.Element, namespaces map[string]string) (In
 		var children []Instruction
 		if sel == "" {
 			var err error
-			children, err = compileChildren(elt, namespaces)
+			children, err = compileChildren(elt, expandText, namespaces)
 			if err != nil {
 				return nil, err
 			}
@@ -677,11 +737,13 @@ func compileXSLInstruction(elt *goxml.Element, namespaces map[string]string) (In
 			return nil, fmt.Errorf("XSLT: xsl:for-each-group missing select attribute (line %d)", elt.Line)
 		}
 		groupBy := attrValue(elt, "group-by")
+		groupAdjacent := attrValue(elt, "group-adjacent")
 		groupStartingWith := attrValue(elt, "group-starting-with")
-		if groupBy == "" && groupStartingWith == "" {
-			return nil, fmt.Errorf("XSLT: xsl:for-each-group missing group-by or group-starting-with attribute (line %d)", elt.Line)
+		groupEndingWith := attrValue(elt, "group-ending-with")
+		if groupBy == "" && groupAdjacent == "" && groupStartingWith == "" && groupEndingWith == "" {
+			return nil, fmt.Errorf("XSLT: xsl:for-each-group missing grouping attribute (line %d)", elt.Line)
 		}
-		var groupStartingPat Pattern
+		var groupStartingPat, groupEndingPat Pattern
 		if groupStartingWith != "" {
 			var patErr error
 			groupStartingPat, patErr = parseMatchPattern(groupStartingWith, namespaces)
@@ -689,21 +751,31 @@ func compileXSLInstruction(elt *goxml.Element, namespaces map[string]string) (In
 				return nil, fmt.Errorf("XSLT: xsl:for-each-group group-starting-with (line %d): %w", elt.Line, patErr)
 			}
 		}
+		if groupEndingWith != "" {
+			var patErr error
+			groupEndingPat, patErr = parseMatchPattern(groupEndingWith, namespaces)
+			if patErr != nil {
+				return nil, fmt.Errorf("XSLT: xsl:for-each-group group-ending-with (line %d): %w", elt.Line, patErr)
+			}
+		}
 		sorts, err := extractSorts(elt)
 		if err != nil {
 			return nil, err
 		}
-		children, err := compileChildren(elt, namespaces)
+		children, err := compileChildren(elt, expandText, namespaces)
 		if err != nil {
 			return nil, err
 		}
-		return &XSLForEachGroup{Select: sel, GroupBy: groupBy, GroupStartingPat: groupStartingPat, Sorts: sorts, Children: children}, nil
+		return &XSLForEachGroup{Select: sel, GroupBy: groupBy, GroupAdjacent: groupAdjacent, GroupStartingPat: groupStartingPat, GroupEndingPat: groupEndingPat, Sorts: sorts, Children: children}, nil
 
 	case "result-document":
-		return compileResultDocument(elt, namespaces)
+		return compileResultDocument(elt, expandText, namespaces)
+
+	case "source-document":
+		return compileSourceDocument(elt, expandText, namespaces)
 
 	case "analyze-string":
-		return compileAnalyzeString(elt, namespaces)
+		return compileAnalyzeString(elt, expandText, namespaces)
 
 	case "matching-substring", "non-matching-substring":
 		// Handled by the parent (analyze-string).
@@ -717,12 +789,75 @@ func compileXSLInstruction(elt *goxml.Element, namespaces map[string]string) (In
 		// xsl:with-param is handled by the parent (call-template).
 		return nil, nil
 
+	case "try":
+		return compileTry(elt, expandText, namespaces)
+
+	case "catch":
+		// Handled by the parent (try).
+		return nil, nil
+
+	case "fork":
+		// xsl:fork executes children sequentially (non-streaming).
+		children, err := compileChildren(elt, expandText, namespaces)
+		if err != nil {
+			return nil, err
+		}
+		return &XSLSequenceConstructor{Children: children}, nil
+
+	case "where-populated":
+		// Execute children; if the result is empty, discard it.
+		children, err := compileChildren(elt, expandText, namespaces)
+		if err != nil {
+			return nil, err
+		}
+		return &XSLWherePopulated{Children: children}, nil
+
+	case "on-empty":
+		// Fallback content when parent produces empty output.
+		children, err := compileChildren(elt, expandText, namespaces)
+		if err != nil {
+			return nil, err
+		}
+		return &XSLOnEmpty{Children: children}, nil
+
+	case "on-non-empty":
+		// Additional content when parent produces non-empty output.
+		children, err := compileChildren(elt, expandText, namespaces)
+		if err != nil {
+			return nil, err
+		}
+		return &XSLOnNonEmpty{Children: children}, nil
+
+	case "fallback":
+		// xsl:fallback provides fallback for unsupported instructions.
+		// Since we're executing in a non-streaming context, just compile children.
+		children, err := compileChildren(elt, expandText, namespaces)
+		if err != nil {
+			return nil, err
+		}
+		return &XSLSequenceConstructor{Children: children}, nil
+
+	case "namespace":
+		return compileNamespace(elt, expandText, namespaces)
+
+	case "context-item":
+		// Declaration, not executable. Metadata for template validation.
+		return nil, nil
+
+	case "document":
+		// xsl:document creates a document node. Similar to xsl:result-document without href.
+		children, err := compileChildren(elt, expandText, namespaces)
+		if err != nil {
+			return nil, err
+		}
+		return &XSLSequenceConstructor{Children: children}, nil
+
 	default:
 		return nil, fmt.Errorf("XSLT: unsupported instruction xsl:%s (line %d)", elt.Name, elt.Line)
 	}
 }
 
-func compileChoose(elt *goxml.Element, namespaces map[string]string) (*XSLChoose, error) {
+func compileChoose(elt *goxml.Element, expandText bool, namespaces map[string]string) (*XSLChoose, error) {
 	choose := &XSLChoose{}
 	for _, child := range elt.Children() {
 		childElt, ok := child.(*goxml.Element)
@@ -739,13 +874,13 @@ func compileChoose(elt *goxml.Element, namespaces map[string]string) (*XSLChoose
 			if test == "" {
 				return nil, fmt.Errorf("XSLT: xsl:when missing test attribute (line %d)", childElt.Line)
 			}
-			children, err := compileChildren(childElt, namespaces)
+			children, err := compileChildren(childElt, expandText, namespaces)
 			if err != nil {
 				return nil, err
 			}
 			choose.When = append(choose.When, XSLWhen{Test: test, Children: children})
 		case "otherwise":
-			children, err := compileChildren(childElt, namespaces)
+			children, err := compileChildren(childElt, expandText, namespaces)
 			if err != nil {
 				return nil, err
 			}
@@ -758,7 +893,11 @@ func compileChoose(elt *goxml.Element, namespaces map[string]string) (*XSLChoose
 	return choose, nil
 }
 
-func compileVariable(elt *goxml.Element) (*XSLVariable, error) {
+func compileVariable(elt *goxml.Element, expandTexts ...bool) (*XSLVariable, error) {
+	et := false
+	if len(expandTexts) > 0 {
+		et = expandTexts[0]
+	}
 	name := attrValue(elt, "name")
 	if name == "" {
 		return nil, fmt.Errorf("XSLT: xsl:variable missing name attribute (line %d)", elt.Line)
@@ -767,7 +906,7 @@ func compileVariable(elt *goxml.Element) (*XSLVariable, error) {
 	var children []Instruction
 	if sel == "" {
 		var err error
-		children, err = compileChildren(elt)
+		children, err = compileChildren(elt, et)
 		if err != nil {
 			return nil, err
 		}
@@ -783,15 +922,27 @@ func compileVariable(elt *goxml.Element) (*XSLVariable, error) {
 	return &XSLVariable{Name: name, Select: sel, Children: children, As: asType}, nil
 }
 
-func compileLiteralElement(elt *goxml.Element, namespaces ...map[string]string) (*LiteralElement, error) {
+func compileLiteralElement(elt *goxml.Element, expandText bool, namespaces ...map[string]string) (*LiteralElement, error) {
 	var ns map[string]string
 	if len(namespaces) > 0 {
 		ns = namespaces[0]
 	}
+
+	// Check for xsl:expand-text attribute on literal elements
+	for _, attr := range elt.Attributes() {
+		if attr.Name == "expand-text" && attr.Namespace == xslNS {
+			expandText = attr.Value == "yes"
+			break
+		}
+	}
+
 	var attrs []LiteralAttribute
 	for _, attr := range elt.Attributes() {
-		// Skip xmlns declarations.
+		// Skip xmlns declarations and xsl:expand-text.
 		if attr.Name == "xmlns" || strings.HasPrefix(attr.Name, "xmlns:") {
+			continue
+		}
+		if attr.Name == "expand-text" && attr.Namespace == xslNS {
 			continue
 		}
 		avt, err := parseAVT(attr.Value)
@@ -805,7 +956,7 @@ func compileLiteralElement(elt *goxml.Element, namespaces ...map[string]string) 
 		attrs = append(attrs, LiteralAttribute{Name: attrName, Namespace: attr.Namespace, Value: avt})
 	}
 
-	children, err := compileChildren(elt, ns)
+	children, err := compileChildren(elt, expandText, ns)
 	if err != nil {
 		return nil, err
 	}
@@ -821,11 +972,17 @@ func compileLiteralElement(elt *goxml.Element, namespaces ...map[string]string) 
 
 // compileTemplateBody separates leading xsl:param elements from
 // instructions and returns a TemplateBody.
-func compileTemplateBody(elt *goxml.Element, namespaces ...map[string]string) (*TemplateBody, error) {
+func compileTemplateBody(elt *goxml.Element, expandText bool, namespaces ...map[string]string) (*TemplateBody, error) {
 	var ns map[string]string
 	if len(namespaces) > 0 {
 		ns = namespaces[0]
 	}
+
+	// xsl:template can have its own expand-text attribute
+	if et := attrValue(elt, "expand-text"); et != "" {
+		expandText = et == "yes"
+	}
+
 	var params []TemplateParam
 	var instructions []Instruction
 
@@ -838,7 +995,15 @@ func compileTemplateBody(elt *goxml.Element, namespaces ...map[string]string) (*
 				continue
 			}
 			pastParams = true
-			instructions = append(instructions, &LiteralText{Text: text})
+			lt := &LiteralText{Text: text}
+			if expandText {
+				avt, err := parseAVT(text)
+				if err != nil {
+					return nil, fmt.Errorf("XSLT: error in text value template: %w", err)
+				}
+				lt.TVT = &avt
+			}
+			instructions = append(instructions, lt)
 		case *goxml.Element:
 			childNS := n.Namespaces[n.Prefix]
 			if childNS == xslNS && n.Name == "param" && !pastParams {
@@ -850,7 +1015,7 @@ func compileTemplateBody(elt *goxml.Element, namespaces ...map[string]string) (*
 				var children []Instruction
 				if sel == "" {
 					var err error
-					children, err = compileChildren(n, ns)
+					children, err = compileChildren(n, expandText, ns)
 					if err != nil {
 						return nil, err
 					}
@@ -867,7 +1032,7 @@ func compileTemplateBody(elt *goxml.Element, namespaces ...map[string]string) (*
 			} else {
 				pastParams = true
 				if childNS == xslNS {
-					instr, err := compileXSLInstruction(n, ns)
+					instr, err := compileXSLInstruction(n, expandText, ns)
 					if err != nil {
 						return nil, err
 					}
@@ -875,7 +1040,7 @@ func compileTemplateBody(elt *goxml.Element, namespaces ...map[string]string) (*
 						instructions = append(instructions, instr)
 					}
 				} else {
-					instr, err := compileLiteralElement(n, ns)
+					instr, err := compileLiteralElement(n, expandText, ns)
 					if err != nil {
 						return nil, err
 					}
@@ -892,7 +1057,7 @@ func compileTemplateBody(elt *goxml.Element, namespaces ...map[string]string) (*
 }
 
 // compileAttribute compiles an xsl:attribute element.
-func compileAttribute(elt *goxml.Element, namespaces map[string]string) (*XSLAttribute, error) {
+func compileAttribute(elt *goxml.Element, expandText bool, namespaces map[string]string) (*XSLAttribute, error) {
 	nameStr := attrValue(elt, "name")
 	if nameStr == "" {
 		return nil, fmt.Errorf("XSLT: xsl:attribute missing name attribute (line %d)", elt.Line)
@@ -913,7 +1078,7 @@ func compileAttribute(elt *goxml.Element, namespaces map[string]string) (*XSLAtt
 	sel := attrValue(elt, "select")
 	var children []Instruction
 	if sel == "" {
-		children, err = compileChildren(elt, namespaces)
+		children, err = compileChildren(elt, expandText, namespaces)
 		if err != nil {
 			return nil, err
 		}
@@ -922,7 +1087,7 @@ func compileAttribute(elt *goxml.Element, namespaces map[string]string) (*XSLAtt
 }
 
 // compileCallTemplate compiles an xsl:call-template element.
-func compileCallTemplate(elt *goxml.Element, namespaces map[string]string) (*XSLCallTemplate, error) {
+func compileCallTemplate(elt *goxml.Element, expandText bool, namespaces map[string]string) (*XSLCallTemplate, error) {
 	name := attrValue(elt, "name")
 	if name == "" {
 		return nil, fmt.Errorf("XSLT: xsl:call-template missing name attribute (line %d)", elt.Line)
@@ -946,7 +1111,7 @@ func compileCallTemplate(elt *goxml.Element, namespaces map[string]string) (*XSL
 		var children []Instruction
 		if sel == "" {
 			var err error
-			children, err = compileChildren(childElt, namespaces)
+			children, err = compileChildren(childElt, expandText, namespaces)
 			if err != nil {
 				return nil, err
 			}
@@ -963,22 +1128,28 @@ func (cc *compileContext) compileFunction(elt *goxml.Element) error {
 		return fmt.Errorf("XSLT: xsl:function missing name attribute (line %d)", elt.Line)
 	}
 
-	// Split prefix:localname
-	var prefix, localName string
-	if idx := strings.IndexByte(name, ':'); idx >= 0 {
-		prefix = name[:idx]
+	// Parse function name: either Q{uri}local (EQName) or prefix:local (QName).
+	var ns, localName string
+	if strings.HasPrefix(name, "Q{") {
+		closeBrace := strings.Index(name, "}")
+		if closeBrace < 0 {
+			return fmt.Errorf("XSLT: xsl:function name '%s': malformed EQName (line %d)", name, elt.Line)
+		}
+		ns = name[2:closeBrace]
+		localName = name[closeBrace+1:]
+	} else if idx := strings.IndexByte(name, ':'); idx >= 0 {
+		prefix := name[:idx]
 		localName = name[idx+1:]
+		var ok bool
+		ns, ok = elt.Namespaces[prefix]
+		if !ok {
+			ns, ok = cc.ss.Namespaces[prefix]
+		}
+		if !ok {
+			return fmt.Errorf("XSLT: xsl:function name '%s': cannot resolve prefix '%s' (line %d)", name, prefix, elt.Line)
+		}
 	} else {
 		return fmt.Errorf("XSLT: xsl:function name '%s' must be in a namespace (line %d)", name, elt.Line)
-	}
-
-	// Resolve prefix to namespace URI (check element namespaces first, then stylesheet)
-	ns, ok := elt.Namespaces[prefix]
-	if !ok {
-		ns, ok = cc.ss.Namespaces[prefix]
-	}
-	if !ok {
-		return fmt.Errorf("XSLT: xsl:function name '%s': cannot resolve prefix '%s' (line %d)", name, prefix, elt.Line)
 	}
 
 	var asType *SequenceType
@@ -990,7 +1161,7 @@ func (cc *compileContext) compileFunction(elt *goxml.Element) error {
 		}
 	}
 
-	body, err := compileTemplateBody(elt, cc.ss.Namespaces)
+	body, err := compileTemplateBody(elt, cc.expandText, cc.ss.Namespaces)
 	if err != nil {
 		return err
 	}
@@ -1249,6 +1420,64 @@ func parseBasePattern(s string, namespaces map[string]string) (Pattern, error) {
 		return parseKeyPattern(s, namespaces)
 	}
 
+	// element() / element(*) / element(name) pattern
+	if strings.HasPrefix(s, "element(") && strings.HasSuffix(s, ")") {
+		inner := strings.TrimSpace(s[8 : len(s)-1])
+		if inner == "" || inner == "*" {
+			return &WildcardTest{Kind: NodeElement}, nil
+		}
+		// element(name) or element(ns:name) — ignore optional type annotation after comma
+		if idx := strings.Index(inner, ","); idx >= 0 {
+			inner = strings.TrimSpace(inner[:idx])
+		}
+		if strings.Contains(inner, ":") {
+			parts := strings.SplitN(inner, ":", 2)
+			nsURI := namespaces[parts[0]]
+			if parts[1] == "*" {
+				return &NamespaceWildcardTest{NamespaceURI: nsURI, Kind: NodeElement}, nil
+			}
+			return &NameTest{LocalName: parts[1], NamespaceURI: nsURI, Kind: NodeElement}, nil
+		}
+		if inner == "*" || inner == "" {
+			return &WildcardTest{Kind: NodeElement}, nil
+		}
+		return &NameTest{LocalName: inner, Kind: NodeElement}, nil
+	}
+
+	// attribute() / attribute(*) / attribute(name) pattern
+	if strings.HasPrefix(s, "attribute(") && strings.HasSuffix(s, ")") {
+		inner := strings.TrimSpace(s[10 : len(s)-1])
+		if inner == "" || inner == "*" {
+			return &WildcardTest{Kind: NodeAttribute}, nil
+		}
+		if idx := strings.Index(inner, ","); idx >= 0 {
+			inner = strings.TrimSpace(inner[:idx])
+		}
+		if strings.Contains(inner, ":") {
+			parts := strings.SplitN(inner, ":", 2)
+			nsURI := namespaces[parts[0]]
+			if parts[1] == "*" {
+				return &NamespaceWildcardTest{NamespaceURI: nsURI, Kind: NodeAttribute}, nil
+			}
+			return &NameTest{LocalName: parts[1], NamespaceURI: nsURI, Kind: NodeAttribute}, nil
+		}
+		return &NameTest{LocalName: inner, Kind: NodeAttribute}, nil
+	}
+
+	// document-node() pattern
+	if s == "document-node()" {
+		return &AnyNodeTest{}, nil
+	}
+
+	// schema-element(name) — treat leniently as element name test
+	if strings.HasPrefix(s, "schema-element(") && strings.HasSuffix(s, ")") {
+		inner := strings.TrimSpace(s[15 : len(s)-1])
+		if inner == "" || inner == "*" {
+			return &WildcardTest{Kind: NodeElement}, nil
+		}
+		return &NameTest{LocalName: inner, Kind: NodeElement}, nil
+	}
+
 	// Attribute pattern: @name or @*
 	if strings.HasPrefix(s, "@") {
 		name := s[1:]
@@ -1342,7 +1571,7 @@ func expandQName(name string, namespaces map[string]string) string {
 }
 
 // compileElement compiles an xsl:element instruction.
-func compileElement(elt *goxml.Element, namespaces map[string]string) (*XSLElement, error) {
+func compileElement(elt *goxml.Element, expandText bool, namespaces map[string]string) (*XSLElement, error) {
 	nameStr := attrValue(elt, "name")
 	if nameStr == "" {
 		return nil, fmt.Errorf("XSLT: xsl:element missing name attribute (line %d)", elt.Line)
@@ -1358,20 +1587,41 @@ func compileElement(elt *goxml.Element, namespaces map[string]string) (*XSLEleme
 			return nil, fmt.Errorf("XSLT: error parsing namespace AVT in xsl:element: %w", err)
 		}
 	}
-	children, err := compileChildren(elt, namespaces)
+	children, err := compileChildren(elt, expandText, namespaces)
 	if err != nil {
 		return nil, err
 	}
 	return &XSLElement{Name: nameAVT, Namespace: nsAVT, Children: children}, nil
 }
 
+// compileNamespace compiles an xsl:namespace instruction.
+func compileNamespace(elt *goxml.Element, expandText bool, namespaces map[string]string) (*XSLNamespace, error) {
+	nameStr := attrValue(elt, "name")
+	if nameStr == "" {
+		return nil, fmt.Errorf("XSLT: xsl:namespace missing name attribute (line %d)", elt.Line)
+	}
+	nameAVT, err := parseAVT(nameStr)
+	if err != nil {
+		return nil, fmt.Errorf("XSLT: error parsing name AVT in xsl:namespace: %w", err)
+	}
+	sel := attrValue(elt, "select")
+	var children []Instruction
+	if sel == "" {
+		children, err = compileChildren(elt, expandText, namespaces)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &XSLNamespace{Name: nameAVT, Select: sel, Children: children}, nil
+}
+
 // compileComment compiles an xsl:comment instruction.
-func compileComment(elt *goxml.Element, namespaces map[string]string) (*XSLComment, error) {
+func compileComment(elt *goxml.Element, expandText bool, namespaces map[string]string) (*XSLComment, error) {
 	sel := attrValue(elt, "select")
 	var children []Instruction
 	if sel == "" {
 		var err error
-		children, err = compileChildren(elt, namespaces)
+		children, err = compileChildren(elt, expandText, namespaces)
 		if err != nil {
 			return nil, err
 		}
@@ -1380,7 +1630,7 @@ func compileComment(elt *goxml.Element, namespaces map[string]string) (*XSLComme
 }
 
 // compileProcessingInstruction compiles an xsl:processing-instruction instruction.
-func compileProcessingInstruction(elt *goxml.Element, namespaces map[string]string) (*XSLProcessingInstruction, error) {
+func compileProcessingInstruction(elt *goxml.Element, expandText bool, namespaces map[string]string) (*XSLProcessingInstruction, error) {
 	nameStr := attrValue(elt, "name")
 	if nameStr == "" {
 		return nil, fmt.Errorf("XSLT: xsl:processing-instruction missing name attribute (line %d)", elt.Line)
@@ -1392,7 +1642,7 @@ func compileProcessingInstruction(elt *goxml.Element, namespaces map[string]stri
 	sel := attrValue(elt, "select")
 	var children []Instruction
 	if sel == "" {
-		children, err = compileChildren(elt, namespaces)
+		children, err = compileChildren(elt, expandText, namespaces)
 		if err != nil {
 			return nil, err
 		}
@@ -1401,13 +1651,13 @@ func compileProcessingInstruction(elt *goxml.Element, namespaces map[string]stri
 }
 
 // compileMessage compiles an xsl:message instruction.
-func compileMessage(elt *goxml.Element, namespaces map[string]string) (*XSLMessage, error) {
+func compileMessage(elt *goxml.Element, expandText bool, namespaces map[string]string) (*XSLMessage, error) {
 	terminate := attrValue(elt, "terminate") == "yes"
 	sel := attrValue(elt, "select")
 	var children []Instruction
 	if sel == "" {
 		var err error
-		children, err = compileChildren(elt, namespaces)
+		children, err = compileChildren(elt, expandText, namespaces)
 		if err != nil {
 			return nil, err
 		}
@@ -1451,24 +1701,88 @@ func compileNumber(elt *goxml.Element, namespaces map[string]string) (*XSLNumber
 }
 
 // compileResultDocument compiles an xsl:result-document instruction.
-func compileResultDocument(elt *goxml.Element, namespaces map[string]string) (*XSLResultDocument, error) {
+func compileResultDocument(elt *goxml.Element, expandText bool, namespaces map[string]string) (*XSLResultDocument, error) {
 	hrefStr := attrValue(elt, "href")
-	if hrefStr == "" {
-		return nil, fmt.Errorf("XSLT: xsl:result-document missing href attribute (line %d)", elt.Line)
+	var hrefAVT AVT
+	if hrefStr != "" {
+		var err error
+		hrefAVT, err = parseAVT(hrefStr)
+		if err != nil {
+			return nil, fmt.Errorf("XSLT: error parsing href AVT in xsl:result-document: %w", err)
+		}
 	}
-	hrefAVT, err := parseAVT(hrefStr)
-	if err != nil {
-		return nil, fmt.Errorf("XSLT: error parsing href AVT in xsl:result-document: %w", err)
-	}
-	children, err := compileChildren(elt, namespaces)
+	children, err := compileChildren(elt, expandText, namespaces)
 	if err != nil {
 		return nil, err
 	}
 	return &XSLResultDocument{Href: hrefAVT, Children: children}, nil
 }
 
+// compileSourceDocument compiles an xsl:source-document instruction.
+func compileSourceDocument(elt *goxml.Element, expandText bool, namespaces map[string]string) (*XSLSourceDocument, error) {
+	hrefStr := attrValue(elt, "href")
+	if hrefStr == "" {
+		return nil, fmt.Errorf("XSLT: xsl:source-document missing href attribute (line %d)", elt.Line)
+	}
+	hrefAVT, err := parseAVT(hrefStr)
+	if err != nil {
+		return nil, fmt.Errorf("XSLT: error parsing href AVT in xsl:source-document: %w", err)
+	}
+	children, err := compileChildren(elt, expandText, namespaces)
+	if err != nil {
+		return nil, err
+	}
+	return &XSLSourceDocument{Href: hrefAVT, Children: children}, nil
+}
+
+// compileTry compiles an xsl:try instruction with its xsl:catch children.
+func compileTry(elt *goxml.Element, expandText bool, namespaces map[string]string) (*XSLTry, error) {
+	tryInstr := &XSLTry{
+		Select: attrValue(elt, "select"),
+	}
+
+	// Build a virtual element containing only the non-catch children for the try body.
+	// Then compile catch clauses separately.
+	for _, child := range elt.Children() {
+		childElt, ok := child.(*goxml.Element)
+		if !ok {
+			continue
+		}
+		childNS := childElt.Namespaces[childElt.Prefix]
+		if childNS == xslNS && childElt.Name == "catch" {
+			errors := attrValue(childElt, "errors")
+			if errors == "" {
+				errors = "*"
+			}
+			catchChildren, err := compileChildren(childElt, expandText, namespaces)
+			if err != nil {
+				return nil, err
+			}
+			tryInstr.Catches = append(tryInstr.Catches, XSLCatch{
+				Errors:   errors,
+				Children: catchChildren,
+				Select:   attrValue(childElt, "select"),
+			})
+		}
+	}
+
+	// Compile the try body: all children except xsl:catch and xsl:fallback.
+	// We use compileChildren which handles text nodes, literal elements, and XSL instructions.
+	// Since compileChildren processes all children and xsl:catch returns nil from
+	// compileXSLInstruction, we can just use compileChildren directly.
+	if tryInstr.Select == "" {
+		children, err := compileChildren(elt, expandText, namespaces)
+		if err != nil {
+			return nil, err
+		}
+		tryInstr.Children = children
+	}
+
+	return tryInstr, nil
+}
+
 // compileAnalyzeString compiles an xsl:analyze-string instruction.
-func compileAnalyzeString(elt *goxml.Element, namespaces map[string]string) (*XSLAnalyzeString, error) {
+func compileAnalyzeString(elt *goxml.Element, expandText bool, namespaces map[string]string) (*XSLAnalyzeString, error) {
 	sel := attrValue(elt, "select")
 	if sel == "" {
 		return nil, fmt.Errorf("XSLT: xsl:analyze-string missing select attribute (line %d)", elt.Line)
@@ -1506,13 +1820,13 @@ func compileAnalyzeString(elt *goxml.Element, namespaces map[string]string) (*XS
 		}
 		switch childElt.Name {
 		case "matching-substring":
-			children, err := compileChildren(childElt, namespaces)
+			children, err := compileChildren(childElt, expandText, namespaces)
 			if err != nil {
 				return nil, err
 			}
 			instr.Matching = children
 		case "non-matching-substring":
-			children, err := compileChildren(childElt, namespaces)
+			children, err := compileChildren(childElt, expandText, namespaces)
 			if err != nil {
 				return nil, err
 			}
