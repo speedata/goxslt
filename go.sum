@@ -1,7 +1,7 @@
-github.com/speedata/goxml v1.0.8 h1:aY8yCr2epUmXe50FYGPYwrbNj3jwh1yfjuM04jGk18s=
-github.com/speedata/goxml v1.0.8/go.mod h1:G++cv0h2rC8ltAhvQmANDgwMbKRd3MetXlF8PLob6dw=
-github.com/speedata/goxpath v1.0.9 h1:8k3LQ/mjY5PE/BKTzmeoSKYig/uLx/uv59IHDtstYng=
-github.com/speedata/goxpath v1.0.9/go.mod h1:4BvqjEkhk/p847Rtc/3qJD0tImv7SGsBnN0yzuQZQ0M=
+github.com/speedata/goxml v1.0.9 h1:SJ607OEFUGFYabspu+dX5tgvIoO7gtKCqsdSnuFnDW4=
+github.com/speedata/goxml v1.0.9/go.mod h1:G++cv0h2rC8ltAhvQmANDgwMbKRd3MetXlF8PLob6dw=
+github.com/speedata/goxpath v1.0.10 h1:STro3nDwl+Je1LHpJweskmB1j0jz4eU/sl8MElVKj60=
+github.com/speedata/goxpath v1.0.10/go.mod h1:ZrjnDd5r2gw+20UvSM2EGHDwz3qKIp3DmkoCYzxLKiM=
 github.com/speedata/optionparser v1.1.1 h1:fGVD7n3bzRQH/T1iHpUNzdP1hMAgQSY85LTfqxDZ1zM=
 github.com/speedata/optionparser v1.1.1/go.mod h1:JzOMd1kGlM5gtPBy7reOayfHsTXCvd6P4JU8BW0LicE=
 golang.org/x/net v0.48.0 h1:zyQRTTrjc33Lhh0fBgT/H3oZq9WuvRR5gPC70xpDiQU=

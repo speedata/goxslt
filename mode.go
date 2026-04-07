@@ -60,9 +60,10 @@ type Pattern interface {
 // MatchContext provides the context needed during pattern matching (namespace
 // resolution etc.). Can be extended to wrap a goxpath.Context.
 type MatchContext struct {
-	Namespaces map[string]string
-	XPathEval  func(expr string, node goxml.XMLNode) (bool, error)
-	KeyLookup  func(keyName, valueExpr string, ns map[string]string) []goxml.XMLNode
+	Namespaces        map[string]string
+	XPathEval         func(expr string, node goxml.XMLNode) (bool, error)
+	XPathEvalSequence func(expr string, node goxml.XMLNode) ([]any, error)
+	KeyLookup         func(keyName, valueExpr string, ns map[string]string) []goxml.XMLNode
 }
 
 // --------------------------------------------------------------------------
@@ -127,6 +128,7 @@ type TemplateBody struct {
 	Name         string          // optional template name
 	Params       []TemplateParam // declared xsl:param elements
 	Instructions []Instruction   // compiled instruction tree (after params)
+	As           *SequenceType   // optional return type declaration (as attribute)
 }
 
 // --------------------------------------------------------------------------
@@ -416,6 +418,90 @@ func (m *Mode) searchChain(node goxml.XMLNode, ctx *MatchContext, bestRule *Rule
 		}
 		head = head.next
 	}
+	return bestRule, nil
+}
+
+// GetNextRule returns the next matching rule after currentRule (lower rank).
+// Used for xsl:next-match.
+func (m *Mode) GetNextRule(node goxml.XMLNode, ctx *MatchContext, currentRule *Rule) (*Rule, error) {
+	if !m.rankComputed {
+		m.ComputeRankings()
+	}
+
+	var bestRule *Rule
+	var err error
+
+	searchNext := func(chain *ruleChain) error {
+		head := chain.head
+		for head != nil {
+			// Skip rules with rank >= currentRule
+			if head.compareRank(currentRule) >= 0 {
+				if head == currentRule || head.Sequence == currentRule.Sequence {
+					head = head.next
+					continue
+				}
+				if head.compareRank(currentRule) > 0 {
+					head = head.next
+					continue
+				}
+			}
+			// This rule has lower rank than currentRule
+			if bestRule != nil && head.compareRank(bestRule) < 0 {
+				break
+			}
+			if head.Matches(node, ctx) {
+				if bestRule == nil || head.compareRank(bestRule) > 0 {
+					bestRule = head
+				}
+			}
+			head = head.next
+		}
+		return nil
+	}
+
+	switch node.(type) {
+	case *goxml.XMLDocument:
+		if err = searchNext(m.documentChain); err != nil {
+			return nil, err
+		}
+	case *goxml.Element:
+		n := node.(*goxml.Element)
+		if chain, ok := m.namedElementChains[n.Name]; ok {
+			if err = searchNext(chain); err != nil {
+				return nil, err
+			}
+		}
+		if err = searchNext(m.unnamedElementChain); err != nil {
+			return nil, err
+		}
+	case *goxml.Attribute:
+		n := node.(*goxml.Attribute)
+		if chain, ok := m.namedAttributeChains[n.Name]; ok {
+			if err = searchNext(chain); err != nil {
+				return nil, err
+			}
+		}
+		if err = searchNext(m.unnamedAttributeChain); err != nil {
+			return nil, err
+		}
+	case goxml.CharData:
+		if err = searchNext(m.textChain); err != nil {
+			return nil, err
+		}
+	case goxml.Comment:
+		if err = searchNext(m.commentChain); err != nil {
+			return nil, err
+		}
+	case goxml.ProcInst:
+		if err = searchNext(m.piChain); err != nil {
+			return nil, err
+		}
+	}
+
+	if err = searchNext(m.genericChain); err != nil {
+		return nil, err
+	}
+
 	return bestRule, nil
 }
 

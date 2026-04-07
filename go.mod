@@ -3,8 +3,8 @@ module github.com/speedata/goxslt
 go 1.24.0
 
 require (
-	github.com/speedata/goxml v1.0.8
-	github.com/speedata/goxpath v1.0.9
+	github.com/speedata/goxml v1.0.9
+	github.com/speedata/goxpath v1.0.10
 	github.com/speedata/optionparser v1.1.1
 )
 

@@ -50,17 +50,37 @@ func parseSequenceType(s string) (*SequenceType, error) {
 		return nil, fmt.Errorf("empty sequence type")
 	}
 
+	// Strip XPath comments: (: ... :)
+	for strings.Contains(s, "(:") {
+		start := strings.Index(s, "(:")
+		end := strings.Index(s[start+2:], ":)")
+		if end < 0 {
+			break
+		}
+		s = s[:start] + s[start+2+end+2:]
+	}
+	s = strings.TrimSpace(s)
+
+	// Handle empty-sequence()
+	if s == "empty-sequence()" {
+		return &SequenceType{Item: ItemTypeItem, Cardinality: CardZeroOrMore}, nil
+	}
+
 	st := &SequenceType{}
 
-	// Check for trailing occurrence indicator.
+	// Check for trailing occurrence indicator (but not inside parentheses).
 	last := s[len(s)-1]
+	// Make sure the last char is not part of a function-like type: e.g., element()
 	switch last {
 	case '?':
 		st.Cardinality = CardZeroOrOne
 		s = s[:len(s)-1]
 	case '*':
-		st.Cardinality = CardZeroOrMore
-		s = s[:len(s)-1]
+		// Distinguish closing-paren types (map(*), array(*), etc.) from CardZeroOrMore.
+		if !strings.HasSuffix(s, "*)") {
+			st.Cardinality = CardZeroOrMore
+			s = s[:len(s)-1]
+		}
 	case '+':
 		st.Cardinality = CardOneOrMore
 		s = s[:len(s)-1]
@@ -96,8 +116,16 @@ func parseSequenceType(s string) (*SequenceType, error) {
 			st.Item = ItemTypeItem
 		} else if s == "text()" || s == "comment()" || s == "processing-instruction()" || s == "document-node()" || s == "namespace-node()" {
 			st.Item = ItemTypeNode
-		} else if strings.HasPrefix(s, "xs:") || strings.HasPrefix(s, "Q{") {
+		} else if strings.HasPrefix(s, "document-node(") {
+			// document-node(element(...)) etc.
+			st.Item = ItemTypeNode
+		} else if strings.HasPrefix(s, "schema-element(") || strings.HasPrefix(s, "schema-attribute(") {
+			st.Item = ItemTypeItem
+		} else if strings.HasPrefix(s, "xs:") || strings.HasPrefix(s, "xsd:") || strings.HasPrefix(s, "Q{") {
 			// Accept other xs:* types and EQName types leniently.
+			st.Item = ItemTypeItem
+		} else if strings.Contains(s, ":") {
+			// Accept prefixed types (user-defined, e.g. my:partNumberType) leniently.
 			st.Item = ItemTypeItem
 		} else {
 			return nil, fmt.Errorf("unsupported sequence type: %s", s)
@@ -172,6 +200,10 @@ func coerceItem(typ ItemType, item any) (any, error) {
 	case ItemTypeNode:
 		if _, ok := item.(goxml.XMLNode); ok {
 			return item, nil
+		}
+		// Wrap atomic values as text nodes.
+		if s, ok := item.(string); ok {
+			return goxml.CharData{Contents: s}, nil
 		}
 		return nil, fmt.Errorf("expected node(), got %T", item)
 
@@ -254,6 +286,12 @@ func coerceInteger(item any) (any, error) {
 			return nil, fmt.Errorf("cannot convert %v to xs:integer", v)
 		}
 		return int(v), nil
+	case goxpath.XSInteger:
+		return v.V, nil
+	case goxpath.XSDouble:
+		return int(v), nil
+	case goxpath.XSFloat:
+		return int(v), nil
 	case string:
 		return parseStringAsInteger(v)
 	case bool:
@@ -289,6 +327,12 @@ func coerceDouble(item any) (any, error) {
 		return v, nil
 	case int:
 		return float64(v), nil
+	case goxpath.XSDouble:
+		return float64(v), nil
+	case goxpath.XSFloat:
+		return float64(v), nil
+	case goxpath.XSInteger:
+		return float64(v.V), nil
 	case string:
 		f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
 		if err != nil {
@@ -304,6 +348,14 @@ func coerceDouble(item any) (any, error) {
 		f, err := strconv.ParseFloat(strings.TrimSpace(v.Contents), 64)
 		if err != nil {
 			return nil, fmt.Errorf("cannot convert %q to xs:double", v.Contents)
+		}
+		return f, nil
+	case *goxml.Element:
+		// Extract text content and convert to double.
+		sv := goxpath.ItemStringvalue(item)
+		f, err := strconv.ParseFloat(strings.TrimSpace(sv), 64)
+		if err != nil {
+			return nil, fmt.Errorf("cannot convert %T to xs:double", item)
 		}
 		return f, nil
 	default:

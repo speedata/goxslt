@@ -11,15 +11,56 @@ import (
 
 const xslNS = "http://www.w3.org/1999/XSL/Transform"
 
+// variableRefersToSelf checks if an XPath expression references $name.
+// This is a simple scan that looks for $name followed by a non-identifier character
+// (or end of string), to detect self-referencing global variables (XPST0008).
+func variableRefersToSelf(name, expr string) bool {
+	prefix := "$" + name
+	for i := 0; i < len(expr); i++ {
+		idx := strings.Index(expr[i:], prefix)
+		if idx < 0 {
+			return false
+		}
+		pos := i + idx + len(prefix)
+		if pos >= len(expr) {
+			return true // $name at end of expression
+		}
+		ch := expr[pos]
+		// If next char is not a valid name character, it's a reference.
+		if !isXPathNameChar(ch) {
+			return true
+		}
+		i = i + idx + 1
+	}
+	return false
+}
+
+// isXPathNameChar returns true if ch can continue an XPath name.
+func isXPathNameChar(ch byte) bool {
+	return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+		(ch >= '0' && ch <= '9') || ch == '_' || ch == '-' || ch == '.' || ch == ':'
+}
+
 // compileContext holds state during stylesheet compilation, including
 // import precedence tracking, cycle detection, and base path for href resolution.
-type compileContext struct {
-	ss         *Stylesheet
+// allModeRule stores a template rule declared with mode="#all" so it can be
+// retroactively added to modes that are created after the rule was compiled.
+type allModeRule struct {
+	pattern    Pattern
+	body       *TemplateBody
+	precedence int
+	priority   float64
 	seq        int
-	precedence int             // current import precedence level
-	visited    map[string]bool // absolute paths → cycle detection
-	basePath   string          // directory for resolving relative hrefs
-	expandText bool            // current expand-text setting (XSLT 3.0 TVT)
+}
+
+type compileContext struct {
+	ss           *Stylesheet
+	seq          int
+	precedence   int             // current import precedence level
+	visited      map[string]bool // absolute paths → cycle detection
+	basePath     string          // directory for resolving relative hrefs
+	expandText   bool            // current expand-text setting (XSLT 3.0 TVT)
+	allModeRules []allModeRule   // templates with mode="#all"
 }
 
 // Compile parses an XSLT stylesheet (already parsed as a goxml document) and
@@ -47,12 +88,126 @@ func Compile(xsltDoc *goxml.XMLDocument) (*Stylesheet, error) {
 		return nil, err
 	}
 
+	finalizeStylesheet(ss)
+
+	return ss, nil
+}
+
+// finalizeStylesheet computes rankings after compilation and sorts global
+// declarations by dependency order.
+func finalizeStylesheet(ss *Stylesheet) {
 	ss.DefaultMode.ComputeRankings()
 	for _, m := range ss.Modes {
 		m.ComputeRankings()
 	}
+	sortGlobalDecls(ss)
+}
 
-	return ss, nil
+// sortGlobalDecls performs a topological sort of global declarations so that
+// variables/params referenced by a declaration are evaluated first.
+// This handles cases like <xsl:variable name="e6" select="20 to $limit"/>
+// declared before <xsl:param name="limit" select="29"/>.
+func sortGlobalDecls(ss *Stylesheet) {
+	decls := ss.GlobalDecls
+	n := len(decls)
+	if n <= 1 {
+		return
+	}
+
+	// Build name → index map.
+	nameIdx := make(map[string]int, n)
+	for i, d := range decls {
+		nameIdx[declName(d)] = i
+	}
+
+	// Build adjacency: deps[i] = set of indices that decl i depends on.
+	deps := make([]map[int]bool, n)
+	for i, d := range decls {
+		deps[i] = make(map[int]bool)
+		sel := declSelect(d)
+		if sel == "" {
+			continue
+		}
+		for name, j := range nameIdx {
+			if j != i && exprReferencesVar(sel, name) {
+				deps[i][j] = true
+			}
+		}
+	}
+
+	// Kahn's algorithm for topological sort.
+	inDeg := make([]int, n)
+	for i := range deps {
+		inDeg[i] = len(deps[i])
+	}
+
+	// Reverse adjacency for efficient processing.
+	revDeps := make([][]int, n)
+	for i, dset := range deps {
+		for j := range dset {
+			revDeps[j] = append(revDeps[j], i)
+		}
+	}
+
+	var queue []int
+	for i := 0; i < n; i++ {
+		if inDeg[i] == 0 {
+			queue = append(queue, i)
+		}
+	}
+
+	sorted := make([]GlobalDecl, 0, n)
+	for len(queue) > 0 {
+		idx := queue[0]
+		queue = queue[1:]
+		sorted = append(sorted, decls[idx])
+		for _, dep := range revDeps[idx] {
+			inDeg[dep]--
+			if inDeg[dep] == 0 {
+				queue = append(queue, dep)
+			}
+		}
+	}
+
+	if len(sorted) == n {
+		ss.GlobalDecls = sorted
+	}
+	// If len(sorted) < n there's a cycle; keep original order and let
+	// the runtime report the error.
+}
+
+func declName(d GlobalDecl) string {
+	if d.IsParam {
+		return d.Param.Name
+	}
+	return d.Var.Name
+}
+
+func declSelect(d GlobalDecl) string {
+	if d.IsParam {
+		return d.Param.Select
+	}
+	return d.Var.Select
+}
+
+// exprReferencesVar checks whether an XPath expression references $name.
+func exprReferencesVar(expr, name string) bool {
+	prefix := "$" + name
+	for i := 0; i < len(expr); i++ {
+		idx := strings.Index(expr[i:], prefix)
+		if idx < 0 {
+			return false
+		}
+		pos := i + idx + len(prefix)
+		if pos >= len(expr) {
+			return true
+		}
+		if !isXPathNameChar(expr[pos]) {
+			return true
+		}
+		i = i + idx + 1
+	}
+	return false
 }
 
 // CompileFile compiles an XSLT stylesheet from a file path, enabling
@@ -89,10 +244,7 @@ func CompileFile(xsltPath string) (*Stylesheet, error) {
 		return nil, err
 	}
 
-	ss.DefaultMode.ComputeRankings()
-	for _, m := range ss.Modes {
-		m.ComputeRankings()
-	}
+	finalizeStylesheet(ss)
 
 	ss.BasePath = filepath.Dir(absPath)
 	ss.StylesheetDoc = xsltDoc
@@ -134,7 +286,7 @@ func (cc *compileContext) compileStylesheet(xsltDoc *goxml.XMLDocument) error {
 	if rootNS != xslNS {
 		return fmt.Errorf("XSLT: root element is not xsl:stylesheet (namespace: %s)", rootNS)
 	}
-	if root.Name != "stylesheet" && root.Name != "transform" {
+	if root.Name != "stylesheet" && root.Name != "transform" && root.Name != "package" {
 		return fmt.Errorf("XSLT: root element is %s, expected stylesheet or transform", root.Name)
 	}
 
@@ -268,6 +420,10 @@ func (cc *compileContext) compileStylesheet(xsltDoc *goxml.XMLDocument) error {
 			if err != nil {
 				return err
 			}
+			// XPST0008: A global variable must not reference itself in its own select expression.
+			if v.Select != "" && variableRefersToSelf(v.Name, v.Select) {
+				return fmt.Errorf("XPST0008: global variable $%s references itself in its own definition (line %d)", v.Name, elt.Line)
+			}
 			cc.ss.GlobalVars = append(cc.ss.GlobalVars, *v)
 			cc.ss.GlobalDecls = append(cc.ss.GlobalDecls, GlobalDecl{IsParam: false, Var: &cc.ss.GlobalVars[len(cc.ss.GlobalVars)-1]})
 		case "key":
@@ -306,6 +462,15 @@ func (cc *compileContext) compileStylesheet(xsltDoc *goxml.XMLDocument) error {
 		case "mode":
 			name := attrValue(elt, "name")
 			onNoMatch := attrValue(elt, "on-no-match")
+			// Validate warning-on-no-match attribute (XTSE0020).
+			if wonm := attrValue(elt, "warning-on-no-match"); wonm != "" {
+				switch wonm {
+				case "yes", "no", "true", "false", "1", "0":
+					// valid
+				default:
+					return fmt.Errorf("XTSE0020: xsl:mode warning-on-no-match='%s' is not a valid xs:boolean value (line %d)", wonm, elt.Line)
+				}
+			}
 			// Determine built-in rule set.
 			var builtIn BuiltInRuleSet
 			switch onNoMatch {
@@ -459,6 +624,15 @@ func (cc *compileContext) compileTemplate(elt *goxml.Element) error {
 	}
 	body.Name = nameAttr
 
+	// Parse optional as attribute for return type checking.
+	if asStr := attrValue(elt, "as"); asStr != "" {
+		asType, asErr := parseSequenceType(asStr)
+		if asErr != nil {
+			return fmt.Errorf("XSLT: xsl:template name='%s' as='%s': %w", nameAttr, asStr, asErr)
+		}
+		body.As = asType
+	}
+
 	// Register named template (higher precedence wins).
 	if nameAttr != "" {
 		cc.ss.NamedTemplates[nameAttr] = body
@@ -477,23 +651,53 @@ func (cc *compileContext) compileTemplate(elt *goxml.Element) error {
 			}
 		}
 
-		mode := cc.ss.DefaultMode
+		// Multi-mode: mode="a b #default" registers the template in all listed modes.
+		modeNames := []string{""}
 		if modeAttr != "" {
-			var ok bool
-			mode, ok = cc.ss.Modes[modeAttr]
-			if !ok {
-				mode = NewMode(modeAttr, &TextOnlyCopyRuleSet{})
-				cc.ss.Modes[modeAttr] = mode
+			modeNames = strings.Fields(modeAttr)
+		}
+
+		addToMode := func(mode *Mode) {
+			if up, ok := pattern.(*UnionPattern); ok {
+				for i, sub := range up.Patterns {
+					mode.AddRule(sub, body, cc.precedence, sub.DefaultPriority(), cc.seq, i)
+				}
+			} else {
+				mode.AddRule(pattern, body, cc.precedence, priority, cc.seq, 0)
 			}
 		}
 
-		// Handle union patterns: split "a | b" into separate rules.
-		if up, ok := pattern.(*UnionPattern); ok {
-			for i, sub := range up.Patterns {
-				mode.AddRule(sub, body, cc.precedence, sub.DefaultPriority(), cc.seq, i)
+		for _, mn := range modeNames {
+			if mn == "#all" {
+				// Register in default mode and all named modes.
+				// Also remember for later so new modes get it too.
+				addToMode(cc.ss.DefaultMode)
+				for _, m := range cc.ss.Modes {
+					addToMode(m)
+				}
+				cc.allModeRules = append(cc.allModeRules, allModeRule{pattern, body, cc.precedence, priority, cc.seq})
+				continue
 			}
-		} else {
-			mode.AddRule(pattern, body, cc.precedence, priority, cc.seq, 0)
+			if mn == "" || mn == "#default" {
+				addToMode(cc.ss.DefaultMode)
+			} else {
+				mode, ok := cc.ss.Modes[mn]
+				if !ok {
+					mode = NewMode(mn, &TextOnlyCopyRuleSet{})
+					cc.ss.Modes[mn] = mode
+					// Add any previously seen #all templates to this new mode.
+					for _, r := range cc.allModeRules {
+						if up, ok := r.pattern.(*UnionPattern); ok {
+							for i, sub := range up.Patterns {
+								mode.AddRule(sub, r.body, r.precedence, sub.DefaultPriority(), r.seq, i)
+							}
+						} else {
+							mode.AddRule(r.pattern, r.body, r.precedence, r.priority, r.seq, 0)
+						}
+					}
+				}
+				addToMode(mode)
+			}
 		}
 		cc.seq++
 	}
@@ -591,6 +795,37 @@ func compileXSLInstruction(elt *goxml.Element, expandText bool, namespaces map[s
 			withParams = append(withParams, XSLWithParam{Name: pname, Select: wpsel, Children: children})
 		}
 		return &XSLApplyTemplates{Select: sel, Mode: mode, Sorts: sorts, WithParams: withParams}, nil
+
+	case "next-match", "apply-imports":
+		var withParams []XSLWithParam
+		for _, child := range elt.Children() {
+			childElt, ok := child.(*goxml.Element)
+			if !ok {
+				continue
+			}
+			childNS := childElt.Namespaces[childElt.Prefix]
+			if childNS != xslNS || childElt.Name != "with-param" {
+				continue
+			}
+			pname := attrValue(childElt, "name")
+			if pname == "" {
+				return nil, fmt.Errorf("XSLT: xsl:with-param missing name attribute (line %d)", childElt.Line)
+			}
+			wpsel := attrValue(childElt, "select")
+			var children []Instruction
+			if wpsel == "" {
+				var err error
+				children, err = compileChildren(childElt, expandText, namespaces)
+				if err != nil {
+					return nil, err
+				}
+			}
+			withParams = append(withParams, XSLWithParam{Name: pname, Select: wpsel, Children: children})
+		}
+		if elt.Name == "next-match" {
+			return &XSLNextMatch{WithParams: withParams}, nil
+		}
+		return &XSLApplyImports{WithParams: withParams}, nil
 
 	case "value-of":
 		sel := attrValue(elt, "select")
@@ -781,8 +1016,39 @@ func compileXSLInstruction(elt *goxml.Element, expandText bool, namespaces map[s
 		// Handled by the parent (analyze-string).
 		return nil, nil
 
+	case "perform-sort":
+		sel := attrValue(elt, "select")
+		sorts, err := extractSorts(elt)
+		if err != nil {
+			return nil, err
+		}
+		var children []Instruction
+		if sel == "" {
+			// Validate: xsl:sort elements must come before other children (XTSE0010).
+			seenNonSort := false
+			for _, child := range elt.Children() {
+				childElt, ok := child.(*goxml.Element)
+				if !ok {
+					continue
+				}
+				childNS := childElt.Namespaces[childElt.Prefix]
+				if childNS == xslNS && childElt.Name == "sort" {
+					if seenNonSort {
+						return nil, fmt.Errorf("XTSE0010: xsl:sort elements must come before other children in xsl:perform-sort (line %d)", childElt.Line)
+					}
+				} else {
+					seenNonSort = true
+				}
+			}
+			children, err = compileChildren(elt, expandText, namespaces)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return &XSLPerformSort{Select: sel, Sorts: sorts, Children: children}, nil
+
 	case "sort":
-		// xsl:sort is handled by the parent (for-each / apply-templates).
+		// xsl:sort is handled by the parent (for-each / apply-templates / perform-sort).
 		return nil, nil
 
 	case "with-param":
@@ -853,6 +1119,24 @@ func compileXSLInstruction(elt *goxml.Element, expandText bool, namespaces map[s
 		return &XSLSequenceConstructor{Children: children}, nil
 
 	default:
+		// Forwards-compatible mode: compile xsl:fallback children if present.
+		var fallbackChildren []Instruction
+		for _, child := range elt.Children() {
+			childElt, ok := child.(*goxml.Element)
+			if !ok {
+				continue
+			}
+			if childElt.Name == "fallback" && childElt.Namespaces[childElt.Prefix] == xslNS {
+				children, err := compileChildren(childElt, expandText, namespaces)
+				if err != nil {
+					return nil, err
+				}
+				fallbackChildren = append(fallbackChildren, children...)
+			}
+		}
+		if len(fallbackChildren) > 0 {
+			return &XSLSequenceConstructor{Children: fallbackChildren}, nil
+		}
 		return nil, fmt.Errorf("XSLT: unsupported instruction xsl:%s (line %d)", elt.Name, elt.Line)
 	}
 }
@@ -945,7 +1229,15 @@ func compileLiteralElement(elt *goxml.Element, expandText bool, namespaces ...ma
 		if attr.Name == "expand-text" && attr.Namespace == xslNS {
 			continue
 		}
-		avt, err := parseAVT(attr.Value)
+		// Skip all other xsl: namespace attributes on literal result elements
+		// (e.g. xsl:xpath-default-namespace, xsl:exclude-result-prefixes, xsl:use-attribute-sets).
+		if attr.Namespace == xslNS {
+			continue
+		}
+		// XML attribute value normalization: replace \t, \n, \r with space
+		// (Go's encoding/xml does not perform this normalization).
+		normalizedValue := strings.NewReplacer("\t", " ", "\n", " ", "\r", " ").Replace(attr.Value)
+		avt, err := parseAVT(normalizedValue)
 		if err != nil {
 			return nil, fmt.Errorf("XSLT: error parsing AVT in attribute %s: %w", attr.Name, err)
 		}
@@ -1193,6 +1485,7 @@ func parseAVT(s string) (AVT, error) {
 				depth := 0
 				inString := false
 				stringChar := byte(0)
+				inComment := 0 // nesting depth of XPath comments (: :)
 				j := i + 1
 				for j < len(s) {
 					ch := s[j]
@@ -1200,11 +1493,30 @@ func parseAVT(s string) (AVT, error) {
 						if ch == stringChar {
 							inString = false
 						}
+					} else if inComment > 0 {
+						if ch == ':' && j+1 < len(s) && s[j+1] == ')' {
+							inComment--
+							j++
+						} else if ch == '(' && j+1 < len(s) && s[j+1] == ':' {
+							inComment++
+							j++
+						}
 					} else {
 						switch ch {
 						case '\'', '"':
 							inString = true
 							stringChar = ch
+						case '(':
+							if j+1 < len(s) && s[j+1] == ':' {
+								inComment++
+								j++
+							} else {
+								depth++
+							}
+						case ')':
+							if depth > 0 {
+								depth--
+							}
 						case '{':
 							depth++
 						case '}':
@@ -1219,10 +1531,10 @@ func parseAVT(s string) (AVT, error) {
 				return AVT{}, fmt.Errorf("unterminated '{' in AVT: %s", s)
 			found:
 				expr := strings.TrimSpace(s[i+1 : j])
-				if expr == "" {
-					return AVT{}, fmt.Errorf("empty expression in AVT: %s", s)
+				if expr != "" {
+					parts = append(parts, AVTPart{Expr: expr})
 				}
-				parts = append(parts, AVTPart{Expr: expr})
+				// Empty expression {} produces empty string (XSLT 3.0 bug 29226).
 				i = j + 1
 			}
 		case '}':
@@ -1277,15 +1589,39 @@ func extractSorts(elt *goxml.Element) ([]SortKey, error) {
 		if sel == "" {
 			sel = "."
 		}
-		order := attrValue(childElt, "order")
-		if order == "" {
-			order = "ascending"
+		orderStr := attrValue(childElt, "order")
+		if orderStr == "" {
+			orderStr = "ascending"
 		}
-		dataType := attrValue(childElt, "data-type")
-		if dataType == "" {
-			dataType = "text"
+		orderAVT, err := parseAVT(orderStr)
+		if err != nil {
+			return nil, err
 		}
-		sorts = append(sorts, SortKey{Select: sel, Order: order, DataType: dataType})
+		dataTypeStr := attrValue(childElt, "data-type")
+		dataTypeExplicit := dataTypeStr != ""
+		if dataTypeStr == "" {
+			dataTypeStr = "text"
+		}
+		dataTypeAVT, err := parseAVT(dataTypeStr)
+		if err != nil {
+			return nil, err
+		}
+		lang := attrValue(childElt, "lang")
+		caseOrderStr := attrValue(childElt, "case-order")
+		var caseOrderAVT AVT
+		if caseOrderStr != "" {
+			caseOrderAVT, err = parseAVT(caseOrderStr)
+			if err != nil {
+				return nil, err
+			}
+		}
+		stable := attrValue(childElt, "stable")
+		collation := attrValue(childElt, "collation")
+		sorts = append(sorts, SortKey{
+			Select: sel, Order: orderAVT, DataType: dataTypeAVT,
+			DataTypeExplicit: dataTypeExplicit,
+			Lang: lang, CaseOrder: caseOrderAVT, Stable: stable, Collation: collation,
+		})
 	}
 	return sorts, nil
 }
@@ -1298,7 +1634,7 @@ func extractSorts(elt *goxml.Element) ([]SortKey, error) {
 func parseMatchPattern(s string, namespaces map[string]string) (Pattern, error) {
 	s = strings.TrimSpace(s)
 
-	// Union pattern: "a | b" (predicate-aware split)
+	// Union pattern: "a | b" or "a union b" (predicate-aware split)
 	if parts := splitTopLevelOn(s, '|'); len(parts) > 1 {
 		var patterns []Pattern
 		for _, p := range parts {
@@ -1310,14 +1646,35 @@ func parseMatchPattern(s string, namespaces map[string]string) (Pattern, error) 
 		}
 		return &UnionPattern{Patterns: patterns}, nil
 	}
+	// "union" keyword as synonym for "|"
+	if parts := splitTopLevelKeyword(s, "union"); len(parts) > 1 {
+		var patterns []Pattern
+		for _, p := range parts {
+			pat, err := parseMatchPattern(p, namespaces)
+			if err != nil {
+				return nil, err
+			}
+			patterns = append(patterns, pat)
+		}
+		return &UnionPattern{Patterns: patterns}, nil
+	}
+
+	// "except" and "intersect" patterns (XSLT 3.0): delegate to XPath-based matching.
+	if parts := splitTopLevelKeyword(s, "except"); len(parts) > 1 {
+		return &XPathPattern{Expr: "(" + s + ")", Namespaces: namespaces}, nil
+	}
+	if parts := splitTopLevelKeyword(s, "intersect"); len(parts) > 1 {
+		return &XPathPattern{Expr: "(" + s + ")", Namespaces: namespaces}, nil
+	}
 
 	// Document root: "/"
 	if s == "/" {
 		return &NodeKindTest{Kind: NodeDocument}, nil
 	}
 
-	// Path pattern: "a/b" or "a//b" (predicate-aware check)
-	if containsTopLevel(s, '/') {
+	// Path pattern: "a/b" or "a//b" (predicate-aware check).
+	// But skip if this is a simple EQName (Q{uri}name) where the '/' is inside the URI.
+	if containsTopLevel(s, '/') && !isEQNameOnly(s) {
 		return parsePathPattern(s, namespaces)
 	}
 
@@ -1378,6 +1735,13 @@ func parsePathPattern(s string, namespaces map[string]string) (Pattern, error) {
 func parseSimplePattern(s string, namespaces map[string]string) (Pattern, error) {
 	s = strings.TrimSpace(s)
 
+	// Check for parenthesized pattern before splitting predicates,
+	// because (a[p]|b[q]) would be mis-split by splitPredicates.
+	if len(s) > 2 && s[0] == '(' && findMatchingParen(s) == len(s)-1 {
+		inner := strings.TrimSpace(s[1 : len(s)-1])
+		return parseMatchPattern(inner, namespaces)
+	}
+
 	// Split off predicates: "book[@lang='en']" → base="book", preds=["@lang='en'"]
 	base, predicates := splitPredicates(s)
 
@@ -1415,9 +1779,61 @@ func parseBasePattern(s string, namespaces map[string]string) (Pattern, error) {
 		return &AnyNodeTest{}, nil
 	}
 
+	// processing-instruction(name) pattern: match PI by target name.
+	if strings.HasPrefix(s, "processing-instruction(") && strings.HasSuffix(s, ")") {
+		inner := strings.TrimSpace(s[23 : len(s)-1])
+		// Remove surrounding quotes if present: processing-instruction('name') or processing-instruction("name")
+		if len(inner) >= 2 && ((inner[0] == '\'' && inner[len(inner)-1] == '\'') || (inner[0] == '"' && inner[len(inner)-1] == '"')) {
+			inner = inner[1 : len(inner)-1]
+		}
+		if inner == "" {
+			return &NodeKindTest{Kind: NodeProcessingInstruction}, nil
+		}
+		return &PINameTest{Name: inner}, nil
+	}
+
+	// Parenthesized expression: (a|b), (a|b|c), etc. — treat as union pattern.
+	if strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")") {
+		inner := strings.TrimSpace(s[1 : len(s)-1])
+		return parseMatchPattern(inner, namespaces)
+	}
+
+	// Q{uri}name — EQName pattern.
+	if strings.HasPrefix(s, "Q{") {
+		closeIdx := strings.Index(s, "}")
+		if closeIdx > 2 {
+			nsURI := s[2:closeIdx]
+			local := s[closeIdx+1:]
+			if local == "*" {
+				return &NamespaceWildcardTest{NamespaceURI: nsURI, Kind: NodeElement}, nil
+			}
+			return &NameTest{LocalName: local, NamespaceURI: nsURI, Kind: NodeElement}, nil
+		}
+	}
+
 	// key() pattern: key('name', expr)
 	if strings.HasPrefix(s, "key(") {
 		return parseKeyPattern(s, namespaces)
+	}
+
+	// id() pattern: id('value') — match node by ID
+	if strings.HasPrefix(s, "id(") {
+		return &XPathPattern{Expr: s, Namespaces: namespaces}, nil
+	}
+
+	// element-with-id() pattern
+	if strings.HasPrefix(s, "element-with-id(") {
+		return &XPathPattern{Expr: s, Namespaces: namespaces}, nil
+	}
+
+	// doc() / document() pattern — function-based match
+	if strings.HasPrefix(s, "doc(") || strings.HasPrefix(s, "document(") {
+		return &XPathPattern{Expr: s, Namespaces: namespaces}, nil
+	}
+
+	// root() pattern
+	if strings.HasPrefix(s, "root(") {
+		return &XPathPattern{Expr: s, Namespaces: namespaces}, nil
 	}
 
 	// element() / element(*) / element(name) pattern
@@ -1464,9 +1880,15 @@ func parseBasePattern(s string, namespaces map[string]string) (Pattern, error) {
 		return &NameTest{LocalName: inner, Kind: NodeAttribute}, nil
 	}
 
-	// document-node() pattern
-	if s == "document-node()" {
-		return &AnyNodeTest{}, nil
+	// document-node() pattern — with optional element/schema-element qualifier
+	if strings.HasPrefix(s, "document-node(") && strings.HasSuffix(s, ")") {
+		inner := strings.TrimSpace(s[14 : len(s)-1])
+		if inner == "" {
+			return &NodeKindTest{Kind: NodeDocument}, nil
+		}
+		// document-node(element(...)) or document-node(schema-element(...))
+		// For now, match any document node (schema-aware matching not supported).
+		return &NodeKindTest{Kind: NodeDocument}, nil
 	}
 
 	// schema-element(name) — treat leniently as element name test
@@ -1495,6 +1917,14 @@ func parseBasePattern(s string, namespaces map[string]string) (Pattern, error) {
 		return &NameTest{LocalName: name, Kind: NodeAttribute}, nil
 	}
 
+	// Variable reference pattern: $var — matches if node is in the variable's value (XSLT 3.0).
+	if strings.HasPrefix(s, "$") {
+		return &XPathPattern{Expr: s, Namespaces: namespaces}, nil
+	}
+
+	// Keywords used as element names: "and", "or", "union", etc.
+	// These are valid XML element names.
+
 	// Element name test (possibly with namespace prefix)
 	if strings.Contains(s, ":") {
 		parts := strings.SplitN(s, ":", 2)
@@ -1519,6 +1949,20 @@ func parseBasePattern(s string, namespaces map[string]string) (Pattern, error) {
 	}
 
 	return nil, fmt.Errorf("unsupported match pattern: %s", s)
+}
+
+// isEQNameOnly returns true if s is a simple Q{uri}local EQName (with no path steps).
+func isEQNameOnly(s string) bool {
+	if !strings.HasPrefix(s, "Q{") {
+		return false
+	}
+	closeIdx := strings.Index(s, "}")
+	if closeIdx < 0 {
+		return false
+	}
+	// After the }, there should be just a local name (no / outside the Q{...}).
+	rest := s[closeIdx+1:]
+	return !strings.Contains(rest, "/")
 }
 
 func isValidName(s string) bool {
@@ -1652,7 +2096,8 @@ func compileProcessingInstruction(elt *goxml.Element, expandText bool, namespace
 
 // compileMessage compiles an xsl:message instruction.
 func compileMessage(elt *goxml.Element, expandText bool, namespaces map[string]string) (*XSLMessage, error) {
-	terminate := attrValue(elt, "terminate") == "yes"
+	terminateStr := strings.TrimSpace(attrValue(elt, "terminate"))
+	terminate := terminateStr == "yes" || terminateStr == "true" || terminateStr == "1"
 	sel := attrValue(elt, "select")
 	var children []Instruction
 	if sel == "" {
@@ -1999,6 +2444,49 @@ func stripStringLiteral(s string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("not a string literal: %s", s)
+}
+
+// splitTopLevelKeyword splits s on a keyword (e.g. "union", "except", "intersect")
+// at the top level, where the keyword is surrounded by whitespace and not inside
+// brackets, parentheses, or string literals.
+func splitTopLevelKeyword(s string, keyword string) []string {
+	kw := " " + keyword + " "
+	var parts []string
+	depth := 0
+	inStr := false
+	var strCh byte
+	start := 0
+	// Pad s with spaces for boundary matching.
+	padded := " " + s + " "
+	for i := 0; i < len(padded); i++ {
+		ch := padded[i]
+		if inStr {
+			if ch == strCh {
+				inStr = false
+			}
+			continue
+		}
+		switch ch {
+		case '\'', '"':
+			inStr = true
+			strCh = ch
+		case '[', '(':
+			depth++
+		case ']', ')':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if depth == 0 && i+len(kw) <= len(padded) && padded[i:i+len(kw)] == kw {
+				// i is offset by 1 from original s due to padding.
+				parts = append(parts, s[start:i-1])
+				start = i - 1 + len(kw) - 2 // skip keyword + spaces in original s
+				i += len(kw) - 1
+			}
+		}
+	}
+	parts = append(parts, s[start:])
+	return parts
 }
 
 // splitTopLevelOn splits s on the given separator byte at the top level

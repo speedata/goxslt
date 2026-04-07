@@ -139,6 +139,17 @@ type XSLWithParam struct {
 	Children []Instruction
 }
 
+// XSLNextMatch finds the next matching template rule (lower priority/precedence)
+// and executes it. Corresponds to <xsl:next-match/>.
+type XSLNextMatch struct {
+	WithParams []XSLWithParam // xsl:with-param children
+}
+
+// XSLApplyImports applies imported template rules. Corresponds to <xsl:apply-imports/>.
+type XSLApplyImports struct {
+	WithParams []XSLWithParam // xsl:with-param children
+}
+
 // XSLSequence evaluates an XPath expression and adds items to the current
 // sequence constructor. Corresponds to <xsl:sequence select="..."/>.
 type XSLSequence struct {
@@ -147,9 +158,22 @@ type XSLSequence struct {
 
 // SortKey defines a sort criterion for xsl:sort.
 type SortKey struct {
-	Select   string // XPath expression; default "."
-	Order    string // "ascending" (default) or "descending"
-	DataType string // "text" (default) or "number"
+	Select          string // XPath expression; default "."
+	Order           AVT    // "ascending" (default) or "descending"
+	DataType        AVT    // "text" (default) or "number"
+	DataTypeExplicit bool  // true if data-type was explicitly set in the stylesheet
+	Lang            string // language tag for collation (e.g. "en", "de")
+	CaseOrder       AVT    // "upper-first" or "lower-first"
+	Stable          string // "yes" or "no"
+	Collation       string // collation URI
+}
+
+// XSLPerformSort sorts a sequence and writes it to the result tree.
+// Corresponds to <xsl:perform-sort select="...">.
+type XSLPerformSort struct {
+	Select   string        // XPath expression for the input sequence (optional)
+	Sorts    []SortKey     // sort keys
+	Children []Instruction // sequence constructor (used when Select is empty)
 }
 
 // XSLElement creates an element with a computed name.

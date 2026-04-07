@@ -297,6 +297,56 @@ func (p *KeyPattern) MatchesNodeKind() NodeKind { return NodeGeneric }
 func (p *KeyPattern) DefaultPriority() float64  { return 0.5 }
 
 // --------------------------------------------------------------------------
+// XPathPattern — matches by evaluating an XPath expression (e.g. id(), doc())
+// --------------------------------------------------------------------------
+
+type XPathPattern struct {
+	Expr       string
+	Namespaces map[string]string
+}
+
+func (p *XPathPattern) Matches(node goxml.XMLNode, ctx *MatchContext) bool {
+	if ctx == nil || ctx.XPathEvalSequence == nil {
+		return false
+	}
+	result, err := ctx.XPathEvalSequence(p.Expr, node)
+	if err != nil {
+		return false
+	}
+	nodeID := node.GetID()
+	for _, item := range result {
+		if n, ok := item.(goxml.XMLNode); ok && n.GetID() == nodeID {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *XPathPattern) Fingerprint() string       { return "" }
+func (p *XPathPattern) MatchesNodeKind() NodeKind { return NodeGeneric }
+func (p *XPathPattern) DefaultPriority() float64  { return 0.5 }
+
+// --------------------------------------------------------------------------
+// PINameTest — matches processing-instruction by target name
+// --------------------------------------------------------------------------
+
+type PINameTest struct {
+	Name string // target name to match
+}
+
+func (p *PINameTest) Matches(node goxml.XMLNode, ctx *MatchContext) bool {
+	pi, ok := node.(goxml.ProcInst)
+	if !ok {
+		return false
+	}
+	return pi.Target == p.Name
+}
+
+func (p *PINameTest) Fingerprint() string       { return p.Name }
+func (p *PINameTest) MatchesNodeKind() NodeKind { return NodeProcessingInstruction }
+func (p *PINameTest) DefaultPriority() float64  { return 0.0 }
+
+// --------------------------------------------------------------------------
 // Helper
 // --------------------------------------------------------------------------
 
