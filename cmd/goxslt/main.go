@@ -29,8 +29,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	if sourcePath == "" || xslPath == "" {
-		fmt.Fprintln(os.Stderr, "Error: both --source and --xsl are required")
+	if xslPath == "" {
+		fmt.Fprintln(os.Stderr, "Error: --xsl is required")
 		op.Help()
 		os.Exit(1)
 	}
@@ -46,28 +46,46 @@ func main() {
 		params[key] = goxpath.Sequence{value}
 	}
 
-	sourceFile, err := os.Open(sourcePath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error opening source: %v\n", err)
-		os.Exit(1)
-	}
-	defer sourceFile.Close()
-
-	sourceDoc, err := goxml.Parse(sourceFile)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error parsing source XML: %v\n", err)
-		os.Exit(1)
-	}
-
 	ss, err := goxslt.CompileFile(xslPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error compiling stylesheet: %v\n", err)
 		os.Exit(1)
 	}
 
+	// Check if the stylesheet has an xsl:initial-template.
+	_, hasInitialTemplate := ss.NamedTemplates["xsl:initial-template"]
+
+	if sourcePath == "" && !hasInitialTemplate {
+		fmt.Fprintln(os.Stderr, "Error: --source is required (no xsl:initial-template found)")
+		op.Help()
+		os.Exit(1)
+	}
+
+	var sourceDoc *goxml.XMLDocument
+	if sourcePath != "" {
+		sourceFile, err := os.Open(sourcePath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error opening source: %v\n", err)
+			os.Exit(1)
+		}
+		defer sourceFile.Close()
+
+		sourceDoc, err = goxml.Parse(sourceFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error parsing source XML: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		// Create an empty document for initial-template mode.
+		sourceDoc = &goxml.XMLDocument{}
+	}
+
 	opts := goxslt.TransformOptions{}
 	if len(params) > 0 {
 		opts.Parameters = params
+	}
+	if hasInitialTemplate {
+		opts.InitialTemplate = "xsl:initial-template"
 	}
 
 	transformResult, err := goxslt.TransformWithOptions(ss, sourceDoc, opts)

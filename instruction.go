@@ -221,6 +221,27 @@ type XSLMapEntry struct {
 	Children []Instruction // body for value (used if Select is empty)
 }
 
+// XSLIterate processes a sequence with accumulating parameters.
+// Corresponds to <xsl:iterate select="...">.
+type XSLIterate struct {
+	Select       string          // XPath expression selecting the input sequence
+	Params       []TemplateParam // iteration parameters (xsl:param)
+	Children     []Instruction   // body to execute per item
+	OnCompletion []Instruction   // xsl:on-completion body (executed when sequence is exhausted)
+}
+
+// XSLNextIteration updates iteration parameters for the next iteration.
+// Corresponds to <xsl:next-iteration>.
+type XSLNextIteration struct {
+	WithParams []XSLWithParam
+}
+
+// XSLBreak terminates an xsl:iterate loop early.
+// Corresponds to <xsl:break>.
+type XSLBreak struct {
+	Children []Instruction // optional content to produce on break
+}
+
 // XSLForEachGroup groups items and iterates over groups.
 // Corresponds to <xsl:for-each-group select="..." group-by="...">.
 type XSLForEachGroup struct {

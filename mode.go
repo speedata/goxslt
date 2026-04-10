@@ -459,13 +459,13 @@ func (m *Mode) GetNextRule(node goxml.XMLNode, ctx *MatchContext, currentRule *R
 		return nil
 	}
 
-	switch node.(type) {
+	switch node := node.(type) {
 	case *goxml.XMLDocument:
 		if err = searchNext(m.documentChain); err != nil {
 			return nil, err
 		}
 	case *goxml.Element:
-		n := node.(*goxml.Element)
+		n := node
 		if chain, ok := m.namedElementChains[n.Name]; ok {
 			if err = searchNext(chain); err != nil {
 				return nil, err
@@ -475,7 +475,7 @@ func (m *Mode) GetNextRule(node goxml.XMLNode, ctx *MatchContext, currentRule *R
 			return nil, err
 		}
 	case *goxml.Attribute:
-		n := node.(*goxml.Attribute)
+		n := node
 		if chain, ok := m.namedAttributeChains[n.Name]; ok {
 			if err = searchNext(chain); err != nil {
 				return nil, err

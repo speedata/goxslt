@@ -151,6 +151,14 @@ var w3cTestSets = map[string]w3cTestSetConfig{
 			"position-7302", "position-7501", "position-7601", "position-7701",
 		},
 	},
+	"iterate": {
+		File: "tests/insn/iterate/_iterate-test-set.xml",
+		Tests: []string{
+			"iterate-001", "iterate-004", "iterate-007",
+			"iterate-014", "iterate-023", "iterate-024",
+			"iterate-033", "iterate-040", "iterate-041",
+		},
+	},
 	"apply-templates": {
 		File: "tests/insn/apply-templates/_apply-templates-test-set.xml",
 		Tests: []string{

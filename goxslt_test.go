@@ -2887,6 +2887,98 @@ func TestExpandTextDisabledByDefault(t *testing.T) {
 	}
 }
 
+func TestIterateBasic(t *testing.T) {
+	result := transformHelper(t,
+		`<items><item>a</item><item>b</item><item>c</item></items>`,
+		`<xsl:stylesheet version="3.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+  <xsl:template match="/">
+    <out>
+      <xsl:iterate select="items/item">
+        <xsl:param name="count" select="0"/>
+        <xsl:value-of select="concat(., ':', $count, ' ')"/>
+        <xsl:next-iteration>
+          <xsl:with-param name="count" select="$count + 1"/>
+        </xsl:next-iteration>
+      </xsl:iterate>
+    </out>
+  </xsl:template>
+</xsl:stylesheet>`)
+	if !strings.Contains(result, "a:0 b:1 c:2") {
+		t.Errorf("expected 'a:0 b:1 c:2', got %s", result)
+	}
+}
+
+func TestIterateOnCompletion(t *testing.T) {
+	result := transformHelper(t,
+		`<items><item>1</item><item>2</item><item>3</item></items>`,
+		`<xsl:stylesheet version="3.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+  <xsl:template match="/">
+    <out>
+      <xsl:iterate select="items/item">
+        <xsl:param name="sum" select="0"/>
+        <xsl:on-completion>
+          <xsl:value-of select="$sum"/>
+        </xsl:on-completion>
+        <xsl:next-iteration>
+          <xsl:with-param name="sum" select="$sum + number(.)"/>
+        </xsl:next-iteration>
+      </xsl:iterate>
+    </out>
+  </xsl:template>
+</xsl:stylesheet>`)
+	if !strings.Contains(result, "6") {
+		t.Errorf("expected sum '6', got %s", result)
+	}
+}
+
+func TestIterateBreak(t *testing.T) {
+	result := transformHelper(t,
+		`<items><item>a</item><item>STOP</item><item>c</item></items>`,
+		`<xsl:stylesheet version="3.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+  <xsl:template match="/">
+    <out>
+      <xsl:iterate select="items/item">
+        <xsl:if test=". = 'STOP'">
+          <xsl:break/>
+        </xsl:if>
+        <xsl:value-of select="concat(., ' ')"/>
+      </xsl:iterate>
+    </out>
+  </xsl:template>
+</xsl:stylesheet>`)
+	if !strings.Contains(result, "a") || strings.Contains(result, "STOP") || strings.Contains(result, "c") {
+		t.Errorf("expected only 'a', got %s", result)
+	}
+}
+
+func TestIterateBreakWithContent(t *testing.T) {
+	result := transformHelper(t,
+		`<items><item>a</item><item>b</item><item>c</item></items>`,
+		`<xsl:stylesheet version="3.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+  <xsl:template match="/">
+    <out>
+      <xsl:iterate select="items/item">
+        <xsl:param name="count" select="0"/>
+        <xsl:if test="$count = 2">
+          <xsl:break>
+            <done count="{$count}"/>
+          </xsl:break>
+        </xsl:if>
+        <xsl:next-iteration>
+          <xsl:with-param name="count" select="$count + 1"/>
+        </xsl:next-iteration>
+      </xsl:iterate>
+    </out>
+  </xsl:template>
+</xsl:stylesheet>`)
+	if !strings.Contains(result, `count="2"`) {
+		t.Errorf("expected done element with count=2, got %s", result)
+	}
+	if strings.Contains(result, `count="3"`) {
+		t.Errorf("should have stopped at count=2, got %s", result)
+	}
+}
+
 func TestExpandTextLocalOverride(t *testing.T) {
 	result := transformHelper(t,
 		`<data><x>7</x></data>`,

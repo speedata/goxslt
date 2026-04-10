@@ -2,6 +2,7 @@ package goxslt
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -150,7 +151,7 @@ func sortGlobalDecls(ss *Stylesheet) {
 	}
 
 	var queue []int
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if inDeg[i] == 0 {
 			queue = append(queue, i)
 		}
@@ -297,9 +298,7 @@ func (cc *compileContext) compileStylesheet(xsltDoc *goxml.XMLDocument) error {
 
 	// Copy namespace declarations from the root element so that
 	// functions and XPath expressions can resolve prefixes.
-	for prefix, uri := range root.Namespaces {
-		cc.ss.Namespaces[prefix] = uri
-	}
+	maps.Copy(cc.ss.Namespaces, root.Namespaces)
 
 	// Build result namespaces: all stylesheet namespaces except XSL namespace
 	// and those listed in exclude-result-prefixes.
@@ -310,7 +309,7 @@ func (cc *compileContext) compileStylesheet(xsltDoc *goxml.XMLDocument) error {
 				excluded[prefix] = true
 			}
 		} else {
-			for _, p := range strings.Fields(erp) {
+			for p := range strings.FieldsSeq(erp) {
 				if p == "#default" {
 					excluded[""] = true
 				} else {
@@ -860,6 +859,23 @@ func compileXSLInstruction(elt *goxml.Element, expandText bool, namespaces map[s
 			return nil, err
 		}
 		return &XSLForEach{Select: sel, Sorts: sorts, Children: children}, nil
+
+	case "iterate":
+		sel := attrValue(elt, "select")
+		if sel == "" {
+			return nil, fmt.Errorf("XSLT: xsl:iterate missing select attribute (line %d)", elt.Line)
+		}
+		return compileIterate(elt, sel, expandText, namespaces)
+
+	case "next-iteration":
+		return compileNextIteration(elt, expandText, namespaces)
+
+	case "break":
+		children, err := compileChildren(elt, expandText, namespaces)
+		if err != nil {
+			return nil, err
+		}
+		return &XSLBreak{Children: children}, nil
 
 	case "if":
 		test := attrValue(elt, "test")
@@ -1414,6 +1430,123 @@ func compileCallTemplate(elt *goxml.Element, expandText bool, namespaces map[str
 	return &XSLCallTemplate{Name: name, WithParams: withParams}, nil
 }
 
+// compileIterate compiles an xsl:iterate element.
+func compileIterate(elt *goxml.Element, sel string, expandText bool, namespaces map[string]string) (*XSLIterate, error) {
+	var params []TemplateParam
+	var onCompletion []Instruction
+	var bodyChildren []Instruction
+
+	pastParams := false
+	for _, child := range elt.Children() {
+		switch n := child.(type) {
+		case goxml.CharData:
+			trimmed := strings.TrimSpace(n.Contents)
+			if trimmed == "" {
+				continue
+			}
+			pastParams = true
+			lt := &LiteralText{Text: n.Contents}
+			if expandText {
+				avt, err := parseAVT(n.Contents)
+				if err != nil {
+					return nil, fmt.Errorf("XSLT: error in text value template: %w", err)
+				}
+				lt.TVT = &avt
+			}
+			bodyChildren = append(bodyChildren, lt)
+		case *goxml.Element:
+			childNS := n.Namespaces[n.Prefix]
+			if childNS == xslNS && n.Name == "param" && !pastParams {
+				name := attrValue(n, "name")
+				if name == "" {
+					return nil, fmt.Errorf("XSLT: xsl:param missing name attribute (line %d)", n.Line)
+				}
+				psel := attrValue(n, "select")
+				var children []Instruction
+				if psel == "" {
+					var err error
+					children, err = compileChildren(n, expandText, namespaces)
+					if err != nil {
+						return nil, err
+					}
+				}
+				var asType *SequenceType
+				if asStr := attrValue(n, "as"); asStr != "" {
+					var asErr error
+					asType, asErr = parseSequenceType(asStr)
+					if asErr != nil {
+						return nil, fmt.Errorf("XSLT: xsl:param name='%s' as='%s': %w", name, asStr, asErr)
+					}
+				}
+				params = append(params, TemplateParam{Name: name, Select: psel, Children: children, As: asType})
+			} else if childNS == xslNS && n.Name == "on-completion" {
+				pastParams = true
+				if sel := attrValue(n, "select"); sel != "" {
+					onCompletion = []Instruction{&XSLSequence{Select: sel}}
+				} else {
+					var err error
+					onCompletion, err = compileChildren(n, expandText, namespaces)
+					if err != nil {
+						return nil, err
+					}
+				}
+			} else if childNS == xslNS && n.Name == "fallback" {
+				// xsl:fallback is ignored when the processor supports the instruction.
+				pastParams = true
+			} else {
+				pastParams = true
+				if childNS == xslNS {
+					instr, err := compileXSLInstruction(n, expandText, namespaces)
+					if err != nil {
+						return nil, err
+					}
+					if instr != nil {
+						bodyChildren = append(bodyChildren, instr)
+					}
+				} else {
+					instr, err := compileLiteralElement(n, expandText, namespaces)
+					if err != nil {
+						return nil, err
+					}
+					bodyChildren = append(bodyChildren, instr)
+				}
+			}
+		}
+	}
+
+	return &XSLIterate{Select: sel, Params: params, Children: bodyChildren, OnCompletion: onCompletion}, nil
+}
+
+// compileNextIteration compiles an xsl:next-iteration element.
+func compileNextIteration(elt *goxml.Element, expandText bool, namespaces map[string]string) (*XSLNextIteration, error) {
+	var withParams []XSLWithParam
+	for _, child := range elt.Children() {
+		childElt, ok := child.(*goxml.Element)
+		if !ok {
+			continue
+		}
+		childNS := childElt.Namespaces[childElt.Prefix]
+		if childNS != xslNS || childElt.Name != "with-param" {
+			continue
+		}
+		pname := attrValue(childElt, "name")
+		if pname == "" {
+			return nil, fmt.Errorf("XSLT: xsl:with-param missing name attribute (line %d)", childElt.Line)
+		}
+		sel := attrValue(childElt, "select")
+		var children []Instruction
+		if sel == "" {
+			var err error
+			children, err = compileChildren(childElt, expandText, namespaces)
+			if err != nil {
+				return nil, err
+			}
+		}
+		withParams = append(withParams, XSLWithParam{Name: pname, Select: sel, Children: children})
+	}
+	return &XSLNextIteration{WithParams: withParams}, nil
+}
+
 func (cc *compileContext) compileFunction(elt *goxml.Element) error {
 	name := attrValue(elt, "name")
 	if name == "" {
@@ -1429,9 +1562,9 @@ func (cc *compileContext) compileFunction(elt *goxml.Element) error {
 		}
 		ns = name[2:closeBrace]
 		localName = name[closeBrace+1:]
-	} else if idx := strings.IndexByte(name, ':'); idx >= 0 {
-		prefix := name[:idx]
-		localName = name[idx+1:]
+	} else if before, after, ok := strings.Cut(name, ":"); ok {
+		prefix := before
+		localName = after
 		var ok bool
 		ns, ok = elt.Namespaces[prefix]
 		if !ok {
@@ -1620,7 +1753,7 @@ func extractSorts(elt *goxml.Element) ([]SortKey, error) {
 		sorts = append(sorts, SortKey{
 			Select: sel, Order: orderAVT, DataType: dataTypeAVT,
 			DataTypeExplicit: dataTypeExplicit,
-			Lang: lang, CaseOrder: caseOrderAVT, Stable: stable, Collation: collation,
+			Lang:             lang, CaseOrder: caseOrderAVT, Stable: stable, Collation: collation,
 		})
 	}
 	return sorts, nil
@@ -1956,12 +2089,12 @@ func isEQNameOnly(s string) bool {
 	if !strings.HasPrefix(s, "Q{") {
 		return false
 	}
-	closeIdx := strings.Index(s, "}")
-	if closeIdx < 0 {
+	_, after, ok := strings.Cut(s, "}")
+	if !ok {
 		return false
 	}
 	// After the }, there should be just a local name (no / outside the Q{...}).
-	rest := s[closeIdx+1:]
+	rest := after
 	return !strings.Contains(rest, "/")
 }
 
@@ -2004,9 +2137,9 @@ func attrValue(elt *goxml.Element, name string) string {
 // expandQName expands a prefixed QName to Clark notation {uri}local using the
 // given namespace mapping. Unprefixed names are returned unchanged.
 func expandQName(name string, namespaces map[string]string) string {
-	if idx := strings.IndexByte(name, ':'); idx >= 0 {
-		prefix := name[:idx]
-		local := name[idx+1:]
+	if before, after, ok := strings.Cut(name, ":"); ok {
+		prefix := before
+		local := after
 		if ns, ok := namespaces[prefix]; ok {
 			return "{" + ns + "}" + local
 		}
