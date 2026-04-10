@@ -68,8 +68,28 @@ func TestW3CSurvey(t *testing.T) {
 			setName = parts[1]
 		}
 
+		// Subprocess timeout: scale with the number of test cases in the set.
+		// Each test gets a 5s per-test timeout in runSurveyTestCaseWithTimeout,
+		// plus typical overhead. We allow ~1s/test plus 30s headroom, capped
+		// at 15 minutes so a single pathological set can't stall the survey.
+		subprocessTimeout := "30s"
+		if data, rerr := os.ReadFile(tsFile); rerr == nil {
+			var ts w3cTestSet
+			if xml.Unmarshal(data, &ts) == nil {
+				n := len(ts.TestCases)
+				secs := n + 30
+				if secs > 900 {
+					secs = 900
+				}
+				if secs < 30 {
+					secs = 30
+				}
+				subprocessTimeout = fmt.Sprintf("%ds", secs)
+			}
+		}
+
 		// Run this test set using the pre-compiled test binary.
-		cmd := exec.Command(testBinary, "-test.v", "-test.run", "TestW3CSurveyOneSet", "-test.timeout", "30s")
+		cmd := exec.Command(testBinary, "-test.v", "-test.run", "TestW3CSurveyOneSet", "-test.timeout", subprocessTimeout)
 		cmd.Env = append(os.Environ(), "W3C_SURVEY_SET_FILE="+tsFile)
 		cmd.Dir = "."
 		output, _ := cmd.CombinedOutput()
