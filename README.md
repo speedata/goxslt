@@ -15,7 +15,7 @@ Over 5000 tests from the [W3C XSLT 3.0 conformance test suite](https://github.co
 - **Full package support** (`xsl:use-package`, `xsl:accept`, `xsl:expose`)
 - **`xsl:iterate`**, **`xsl:merge`**, **`xsl:evaluate`**
 - **`namespace::` axis**
-- **Unicode Collation Algorithm** (sort/compare uses codepoint order)
+- **Unicode Collation Algorithm** is partially supported via `golang.org/x/text/collate` (`lang`, `strength`, `numeric`); `caseFirst`/`alternate`/`maxVariable` are accepted lax. `xsl:sort case-order` is honored via an internal ASCII fallback.
 - **Date/duration arithmetic** (partial)
 
 See the [full documentation](https://doc.speedata.de/goxml/) for details on supported features.

@@ -2371,22 +2371,24 @@ func (instr *XSLCallTemplate) Execute(ctx *TransformContext) error {
 	return err
 }
 
-// compareStrings performs a collation-aware string comparison.
-// caseOrder can be "upper-first", "lower-first", or "" (default: Unicode codepoint order).
-func compareStrings(a, b, caseOrder string) int {
-	if caseOrder == "" {
-		return strings.Compare(a, b)
-	}
+// asciiCaseOrderCollation implements goxpath.Collation by comparing strings
+// case-insensitively under ASCII rules and breaking ties on case according to
+// the XSLT @case-order attribute. It is used as a pragmatic fallback when
+// xsl:sort sets @case-order but no UCA-capable @collation is available.
+type asciiCaseOrderCollation struct {
+	caseOrder string // "upper-first" or "lower-first"
+}
 
-	// Compare case-insensitively first, then break ties by case.
+func (c asciiCaseOrderCollation) URI() string {
+	return "urn:goxslt:case-order:" + c.caseOrder
+}
+
+func (c asciiCaseOrderCollation) Compare(a, b string) int {
 	la := strings.ToLower(a)
 	lb := strings.ToLower(b)
-	cmp := strings.Compare(la, lb)
-	if cmp != 0 {
+	if cmp := strings.Compare(la, lb); cmp != 0 {
 		return cmp
 	}
-
-	// Same letters, different case: compare rune-by-rune for case ordering.
 	ra := []rune(a)
 	rb := []rune(b)
 	minLen := min(len(rb), len(ra))
@@ -2397,25 +2399,69 @@ func compareStrings(a, b, caseOrder string) int {
 		aUpper := ra[i] >= 'A' && ra[i] <= 'Z'
 		bUpper := rb[i] >= 'A' && rb[i] <= 'Z'
 		if aUpper != bUpper {
-			if caseOrder == "upper-first" {
+			if c.caseOrder == "upper-first" {
 				if aUpper {
 					return -1
 				}
 				return 1
 			}
-			// lower-first
 			if aUpper {
 				return 1
 			}
 			return -1
 		}
-		// Both same case, compare normally.
 		if ra[i] < rb[i] {
 			return -1
 		}
 		return 1
 	}
 	return len(ra) - len(rb)
+}
+
+func (c asciiCaseOrderCollation) Equal(a, b string) bool       { return c.Compare(a, b) == 0 }
+func (c asciiCaseOrderCollation) Contains(s, sub string) bool  { return strings.Contains(strings.ToLower(s), strings.ToLower(sub)) }
+func (c asciiCaseOrderCollation) StartsWith(s, p string) bool  { return strings.HasPrefix(strings.ToLower(s), strings.ToLower(p)) }
+func (c asciiCaseOrderCollation) EndsWith(s, suf string) bool  { return strings.HasSuffix(strings.ToLower(s), strings.ToLower(suf)) }
+func (c asciiCaseOrderCollation) Key(s string) string          { return strings.ToLower(s) }
+func (c asciiCaseOrderCollation) SubstringBefore(s, sub string) string {
+	if sub == "" {
+		return ""
+	}
+	if i := strings.Index(strings.ToLower(s), strings.ToLower(sub)); i >= 0 {
+		return s[:i]
+	}
+	return ""
+}
+func (c asciiCaseOrderCollation) SubstringAfter(s, sub string) string {
+	if sub == "" {
+		return s
+	}
+	if i := strings.Index(strings.ToLower(s), strings.ToLower(sub)); i >= 0 {
+		return s[i+len(sub):]
+	}
+	return ""
+}
+
+// resolveSortCollation maps an xsl:sort declaration to a goxpath.Collation.
+//
+// Resolution order:
+//  1. an explicit @collation URI is used as-is (FOCH0002 if unknown).
+//  2. if @case-order is set, an ASCII case-order collation is used; this is
+//     the only locale-free way to honor @case-order, since the underlying
+//     x/text/collate caseFirst extension is not honored in practice.
+//  3. otherwise, if @lang is set, a UCA collation URI is synthesized.
+//  4. otherwise the static default collation of the XPath context is used.
+func resolveSortCollation(tc *TransformContext, sk SortKey, caseOrder string) (goxpath.Collation, error) {
+	if sk.Collation != "" {
+		return goxpath.ResolveCollation(sk.Collation)
+	}
+	if caseOrder == "upper-first" || caseOrder == "lower-first" {
+		return asciiCaseOrderCollation{caseOrder: caseOrder}, nil
+	}
+	if sk.Lang != "" {
+		return goxpath.ResolveCollation(goxpath.UCACollationURI + "?lang=" + sk.Lang)
+	}
+	return tc.XPath.Ctx.Collation(), nil
 }
 
 // evalParamValue evaluates a param/with-param value via select or children body.
@@ -2458,6 +2504,7 @@ func (tc *TransformContext) sortNodes(nodes []goxml.XMLNode, sorts []SortKey) er
 		DataType    string
 		CaseOrder   string
 		AutoNumeric bool // true if data-type was not explicitly set (auto-detect from result type)
+		Coll        goxpath.Collation
 	}
 	resolved := make([]resolvedSort, len(sorts))
 	for j, sk := range sorts {
@@ -2473,9 +2520,14 @@ func (tc *TransformContext) sortNodes(nodes []goxml.XMLNode, sorts []SortKey) er
 			return fmt.Errorf("xsl:sort data-type: %w", err)
 		}
 		caseOrder, _ := tc.evalAVT(sk.CaseOrder)
+		coll, err := resolveSortCollation(tc, sk, caseOrder)
+		if err != nil {
+			return err
+		}
 		resolved[j] = resolvedSort{
 			Select: sk.Select, Order: order, DataType: dataType,
 			CaseOrder: caseOrder, AutoNumeric: !sk.DataTypeExplicit,
+			Coll: coll,
 		}
 	}
 
@@ -2564,7 +2616,7 @@ func (tc *TransformContext) sortNodes(nodes []goxml.XMLNode, sorts []SortKey) er
 					cmp = 0
 				}
 			} else {
-				cmp = compareStrings(va.str, vb.str, rs.CaseOrder)
+				cmp = rs.Coll.Compare(va.str, vb.str)
 			}
 			if rs.Order == "descending" {
 				cmp = -cmp
