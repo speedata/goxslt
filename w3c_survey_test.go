@@ -77,13 +77,7 @@ func TestW3CSurvey(t *testing.T) {
 			var ts w3cTestSet
 			if xml.Unmarshal(data, &ts) == nil {
 				n := len(ts.TestCases)
-				secs := n + 30
-				if secs > 900 {
-					secs = 900
-				}
-				if secs < 30 {
-					secs = 30
-				}
+				secs := max(min(n+30, 900), 30)
 				subprocessTimeout = fmt.Sprintf("%ds", secs)
 			}
 		}
@@ -101,9 +95,8 @@ func TestW3CSurvey(t *testing.T) {
 			Errors:   make(map[string]int),
 		}
 
-		for _, line := range strings.Split(string(output), "\n") {
-			if strings.HasPrefix(line, "SURVEY_RESULT:") {
-				jsonData := strings.TrimPrefix(line, "SURVEY_RESULT:")
+		for line := range strings.SplitSeq(string(output), "\n") {
+			if jsonData, ok := strings.CutPrefix(line, "SURVEY_RESULT:"); ok {
 				var result struct {
 					Total  int            `json:"total"`
 					Pass   int            `json:"pass"`
