@@ -13,13 +13,18 @@ import (
 	"github.com/speedata/optionparser"
 )
 
+// Version is set at build time via -ldflags "-X main.Version=...".
+var Version = "dev"
+
 func main() {
 	var sourcePath, xslPath, outputPath string
+	var showVersion bool
 	op := optionparser.NewOptionParser()
 	op.Banner = "Usage: goxslt -s source.xml -t stylesheet.xsl [-o output.xml] [param=value ...]"
 	op.On("-s", "--source FILE", "Source XML file", &sourcePath)
 	op.On("-t", "--xsl FILE", "XSLT stylesheet file", &xslPath)
 	op.On("-o", "--output FILE", "Write output to FILE (default: stdout)", &outputPath)
+	op.On("-v", "--version", "Print version and exit", &showVersion)
 	err := op.Parse()
 	if errors.Is(err, optionparser.ErrHelp) {
 		os.Exit(0)
@@ -27,6 +32,11 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
+	}
+
+	if showVersion {
+		fmt.Printf("goxslt version %s\n", Version)
+		os.Exit(0)
 	}
 
 	if xslPath == "" {
