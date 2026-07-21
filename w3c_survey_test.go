@@ -255,10 +255,16 @@ func TestW3CSurveyOneSet(t *testing.T) {
 
 	total, pass, fail, panicCount, skip := 0, 0, 0, 0, 0
 	errors := make(map[string]int)
+	// With W3C_SURVEY_DETAIL=1, additionally print one DETAIL:STATUS:name
+	// line per test case to see which individual tests pass or fail.
+	detail := os.Getenv("W3C_SURVEY_DETAIL") != ""
 
 	for _, tc := range ts.TestCases {
 		total++
 		result := runSurveyTestCaseWithTimeout(tc, envMap, testSetDir, 5*time.Second)
+		if detail {
+			fmt.Printf("DETAIL:%s:%s\n", result.Status, tc.Name)
+		}
 		switch result.Status {
 		case "PASS":
 			pass++
