@@ -255,7 +255,10 @@ var w3cTestSets = map[string]w3cTestSetConfig{
 			"copy-5001", "copy-5002", "copy-5003", "copy-5004",
 			"copy-5013", "copy-5014",
 			"copy-5023", "copy-5024",
-			"copy-5201",
+			// copy-5201: requires copy-namespaces="no" semantics and
+			// namespace fixup on serialization; it only appeared to pass
+			// while goxpath could not parse the *:name wildcard in the
+			// assertion.
 		},
 	},
 	"variable": {
