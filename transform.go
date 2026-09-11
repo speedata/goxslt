@@ -229,25 +229,9 @@ func init() {
 			// Simplified: serialize nodes to XML string.
 			var sb strings.Builder
 			for _, item := range args[0] {
-				switch n := item.(type) {
-				case *goxml.XMLDocument:
-					sb.WriteString(n.ToXML())
-				case *goxml.Element:
-					sb.WriteString(n.ToXML())
-				case goxml.CharData:
-					sb.WriteString(n.Contents)
-				case goxml.Comment:
-					sb.WriteString("<!--")
-					sb.WriteString(n.Contents)
-					sb.WriteString("-->")
-				case goxml.ProcInst:
-					sb.WriteString("<?")
-					sb.WriteString(n.Target)
-					if len(n.Inst) > 0 {
-						sb.WriteByte(' ')
-						sb.Write(n.Inst)
-					}
-					sb.WriteString("?>")
+				switch item.(type) {
+				case *goxml.XMLDocument, *goxml.Element, goxml.CharData, goxml.Comment, goxml.ProcInst:
+					serializeNode(&sb, item.(goxml.XMLNode), 0, "", make(map[string]bool))
 				default:
 					sb.WriteString(goxpath.ItemStringvalue(item))
 				}
@@ -3101,7 +3085,9 @@ func (tc *TransformContext) registerUnparsedTextFunction() {
 
 // SerializeResult converts a result document to an XML string.
 func SerializeResult(doc *goxml.XMLDocument) string {
-	return doc.ToXML()
+	var sb strings.Builder
+	serializeNode(&sb, doc, 0, "", make(map[string]bool))
+	return sb.String()
 }
 
 // SerializeWithOutput converts a result document to a string using the given output properties.
@@ -3113,38 +3099,41 @@ func SerializeWithOutput(doc *goxml.XMLDocument, output OutputProperties) string
 			sb.WriteByte('\n')
 		}
 	}
+	indent := ""
 	if output.Indent {
-		nsPrinted := make(map[string]bool)
-		for _, child := range doc.Children() {
-			serializeIndentNode(&sb, child, 0, "  ", nsPrinted)
-		}
-	} else {
-		sb.WriteString(doc.ToXML())
+		indent = "  "
 	}
+	serializeNode(&sb, doc, 0, indent, make(map[string]bool))
 	return sb.String()
 }
 
-// SerializeIndent converts a result document to an indented XML string.
+// SerializeIndent converts a result document to an indented XML string. An
+// empty indentStr produces compact output without any added whitespace.
 func SerializeIndent(doc *goxml.XMLDocument, indentStr string) string {
 	var sb strings.Builder
-	nsPrinted := make(map[string]bool)
-	for _, child := range doc.Children() {
-		serializeIndentNode(&sb, child, 0, indentStr, nsPrinted)
-	}
+	serializeNode(&sb, doc, 0, indentStr, make(map[string]bool))
 	return sb.String()
 }
 
-func serializeIndentNode(sb *strings.Builder, node goxml.XMLNode, depth int, indent string, nsPrinted map[string]bool) {
+// serializeNode writes the XML representation of node to sb. An empty indent
+// string produces compact output without any added whitespace; otherwise each
+// node starts on its own line, indented by depth copies of indent.
+func serializeNode(sb *strings.Builder, node goxml.XMLNode, depth int, indent string, nsPrinted map[string]bool) {
 	switch n := node.(type) {
+	case *goxml.XMLDocument:
+		for _, child := range n.Children() {
+			serializeNode(sb, child, depth, indent, nsPrinted)
+		}
 	case *goxml.Element:
-		serializeIndentElement(sb, n, depth, indent, nsPrinted)
+		serializeElement(sb, n, depth, indent, nsPrinted)
 	case goxml.CharData:
-		sb.WriteString(escapeText(n.Contents))
+		sb.WriteString(goxml.EscapeText(n.Contents))
 	case goxml.Comment:
 		writeIndent(sb, depth, indent)
 		sb.WriteString("<!--")
 		sb.WriteString(n.Contents)
-		sb.WriteString("-->\n")
+		sb.WriteString("-->")
+		endLine(sb, indent)
 	case goxml.ProcInst:
 		writeIndent(sb, depth, indent)
 		sb.WriteString("<?")
@@ -3153,15 +3142,18 @@ func serializeIndentNode(sb *strings.Builder, node goxml.XMLNode, depth int, ind
 			sb.WriteByte(' ')
 			sb.Write(n.Inst)
 		}
-		sb.WriteString("?>\n")
+		sb.WriteString("?>")
+		endLine(sb, indent)
 	}
 }
 
-func serializeIndentElement(sb *strings.Builder, elt *goxml.Element, depth int, indent string, nsPrinted map[string]bool) {
+func serializeElement(sb *strings.Builder, elt *goxml.Element, depth int, indent string, nsPrinted map[string]bool) {
+	compact := indent == ""
 	children := elt.Children()
 
-	// Check if this element has only a single text child (inline it).
-	textOnly := len(children) == 1 && isCharData(children[0])
+	// When indenting, an element with only a single text child is written on
+	// one line.
+	textOnly := !compact && len(children) == 1 && isCharData(children[0])
 
 	writeIndent(sb, depth, indent)
 	sb.WriteByte('<')
@@ -3191,23 +3183,26 @@ func serializeIndentElement(sb *strings.Builder, elt *goxml.Element, depth int, 
 		}
 	}
 
-	// Calculate total attribute length to decide single-line vs multi-line.
 	attrs := elt.Attributes()
-	totalLen := 0
-	for _, ns := range nsDecls {
-		totalLen += 1 + len(ns.attr) + 2 + len(ns.uri) + 1 // ' name="uri"'
-	}
-	for _, attr := range attrs {
-		totalLen += 1 + len(attr.Name) + 2 + len(escapeAttr(attr.Value)) + 1
-	}
 
-	// If element tag (name + attrs) exceeds 80 chars, put each attr on its own line.
-	const lineLimit = 80
-	multiLine := totalLen > 0 && (len(name)+1+totalLen) > lineLimit
+	// When indenting: if the element tag (name + attrs) exceeds 80 chars, put
+	// each attribute on its own line.
+	multiLine := false
 	attrIndent := ""
-	if multiLine {
-		// Indent to align under the first attribute (after "<name ").
-		attrIndent = "\n" + strings.Repeat(" ", depth*len(indent)+1+len(name)+1)
+	if !compact {
+		totalLen := 0
+		for _, ns := range nsDecls {
+			totalLen += 1 + len(ns.attr) + 2 + len(ns.uri) + 1 // ' name="uri"'
+		}
+		for _, attr := range attrs {
+			totalLen += 1 + len(attr.Name) + 2 + len(goxml.EscapeAttr(attr.Value)) + 1
+		}
+		const lineLimit = 80
+		multiLine = totalLen > 0 && (len(name)+1+totalLen) > lineLimit
+		if multiLine {
+			// Indent to align under the first attribute (after "<name ").
+			attrIndent = "\n" + strings.Repeat(" ", depth*len(indent)+1+len(name)+1)
+		}
 	}
 
 	first := true
@@ -3220,7 +3215,7 @@ func serializeIndentElement(sb *strings.Builder, elt *goxml.Element, depth int, 
 		}
 		sb.WriteString(ns.attr)
 		sb.WriteString("=\"")
-		sb.WriteString(escapeAttr(ns.uri))
+		sb.WriteString(goxml.EscapeAttr(ns.uri))
 		sb.WriteByte('"')
 	}
 	for _, attr := range attrs {
@@ -3232,37 +3227,42 @@ func serializeIndentElement(sb *strings.Builder, elt *goxml.Element, depth int, 
 		}
 		sb.WriteString(attr.Name)
 		sb.WriteString("=\"")
-		sb.WriteString(escapeAttr(attr.Value))
+		sb.WriteString(goxml.EscapeAttr(attr.Value))
 		sb.WriteByte('"')
 	}
 
 	if len(children) == 0 {
-		sb.WriteString(" />\n")
+		sb.WriteString(" />")
+		endLine(sb, indent)
 		return
 	}
 	sb.WriteByte('>')
 
 	if textOnly {
-		sb.WriteString(escapeText(children[0].(goxml.CharData).Contents))
+		sb.WriteString(goxml.EscapeText(children[0].(goxml.CharData).Contents))
 		sb.WriteString("</")
 		sb.WriteString(name)
-		sb.WriteString(">\n")
+		sb.WriteByte('>')
+		endLine(sb, indent)
 		return
 	}
 
-	sb.WriteByte('\n')
+	endLine(sb, indent)
 	for _, child := range children {
-		if cd, ok := child.(goxml.CharData); ok {
-			if strings.TrimSpace(cd.Contents) == "" {
-				continue // skip whitespace-only text between elements
+		if !compact {
+			if cd, ok := child.(goxml.CharData); ok {
+				if strings.TrimSpace(cd.Contents) == "" {
+					continue // skip whitespace-only text between elements
+				}
 			}
 		}
-		serializeIndentNode(sb, child, depth+1, indent, nsPrinted)
+		serializeNode(sb, child, depth+1, indent, nsPrinted)
 	}
 	writeIndent(sb, depth, indent)
 	sb.WriteString("</")
 	sb.WriteString(name)
-	sb.WriteString(">\n")
+	sb.WriteByte('>')
+	endLine(sb, indent)
 }
 
 func isCharData(n goxml.XMLNode) bool {
@@ -3276,14 +3276,9 @@ func writeIndent(sb *strings.Builder, depth int, indent string) {
 	}
 }
 
-func escapeText(s string) string {
-	s = strings.ReplaceAll(s, "&", "&amp;")
-	s = strings.ReplaceAll(s, "<", "&lt;")
-	return s
-}
-
-func escapeAttr(s string) string {
-	s = escapeText(s)
-	s = strings.ReplaceAll(s, "\"", "&quot;")
-	return s
+// endLine terminates a line when indenting; compact mode adds no whitespace.
+func endLine(sb *strings.Builder, indent string) {
+	if indent != "" {
+		sb.WriteByte('\n')
+	}
 }
