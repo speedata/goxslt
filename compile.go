@@ -448,7 +448,10 @@ func (cc *compileContext) compileStylesheet(xsltDoc *goxml.XMLDocument) error {
 			if err != nil {
 				return fmt.Errorf("XSLT: xsl:key match='%s': %w", matchStr, err)
 			}
-			composite := attrValue(elt, "composite") == "yes"
+			composite, err := booleanAttr(elt, "xsl:key", "composite", false)
+			if err != nil {
+				return err
+			}
 			expandedName := expandQName(name, elt.Namespaces)
 			// XTSE1222: all xsl:key declarations with the same name must have
 			// the same effective value for the composite attribute.
@@ -462,13 +465,8 @@ func (cc *compileContext) compileStylesheet(xsltDoc *goxml.XMLDocument) error {
 			name := attrValue(elt, "name")
 			onNoMatch := attrValue(elt, "on-no-match")
 			// Validate warning-on-no-match attribute (XTSE0020).
-			if wonm := attrValue(elt, "warning-on-no-match"); wonm != "" {
-				switch wonm {
-				case "yes", "no", "true", "false", "1", "0":
-					// valid
-				default:
-					return fmt.Errorf("XTSE0020: xsl:mode warning-on-no-match='%s' is not a valid xs:boolean value (line %d)", wonm, elt.Line)
-				}
+			if _, err := booleanAttr(elt, "xsl:mode", "warning-on-no-match", true); err != nil {
+				return err
 			}
 			// Determine built-in rule set.
 			var builtIn BuiltInRuleSet
@@ -916,6 +914,10 @@ func compileXSLInstruction(elt *goxml.Element, expandText bool, namespaces map[s
 		if sel == "" {
 			return nil, fmt.Errorf("XSLT: xsl:copy-of missing select attribute (line %d)", elt.Line)
 		}
+		// inherit-namespaces is validated but not yet honoured.
+		if _, err := booleanAttr(elt, "xsl:copy-of", "inherit-namespaces", true); err != nil {
+			return nil, err
+		}
 		return &XSLCopyOf{Select: sel}, nil
 
 	case "choose":
@@ -925,6 +927,10 @@ func compileXSLInstruction(elt *goxml.Element, expandText bool, namespaces map[s
 		return compileVariable(elt, expandText)
 
 	case "copy":
+		// inherit-namespaces is validated but not yet honoured.
+		if _, err := booleanAttr(elt, "xsl:copy", "inherit-namespaces", true); err != nil {
+			return nil, err
+		}
 		children, err := compileChildren(elt, expandText, namespaces)
 		if err != nil {
 			return nil, err
@@ -993,6 +999,11 @@ func compileXSLInstruction(elt *goxml.Element, expandText bool, namespaces map[s
 		groupEndingWith := attrValue(elt, "group-ending-with")
 		if groupBy == "" && groupAdjacent == "" && groupStartingWith == "" && groupEndingWith == "" {
 			return nil, fmt.Errorf("XSLT: xsl:for-each-group missing grouping attribute (line %d)", elt.Line)
+		}
+		// composite is validated but not yet honoured: grouping keys are always
+		// treated as single values.
+		if _, err := booleanAttr(elt, "xsl:for-each-group", "composite", false); err != nil {
+			return nil, err
 		}
 		var groupStartingPat, groupEndingPat Pattern
 		if groupStartingWith != "" {
@@ -2134,6 +2145,26 @@ func attrValue(elt *goxml.Element, name string) string {
 	return ""
 }
 
+// booleanAttr returns the effective value of an XSLT attribute whose permitted
+// values are the xs:boolean lexical forms yes|no|true|false|1|0, or def if the
+// attribute is absent. Leading and trailing whitespace is stripped (XSLT 3.0
+// section 3.8); any other value is a static error (XTSE0020). instr is the
+// instruction name used in the error message, e.g. "xsl:element".
+func booleanAttr(elt *goxml.Element, instr, name string, def bool) (bool, error) {
+	v := attrValue(elt, name)
+	if v == "" {
+		return def, nil
+	}
+	switch strings.TrimSpace(v) {
+	case "yes", "true", "1":
+		return true, nil
+	case "no", "false", "0":
+		return false, nil
+	default:
+		return false, fmt.Errorf("XTSE0020: %s %s='%s' is not a valid xs:boolean value (line %d)", instr, name, v, elt.Line)
+	}
+}
+
 // expandQName expands a prefixed QName to Clark notation {uri}local using the
 // given namespace mapping. Unprefixed names are returned unchanged.
 func expandQName(name string, namespaces map[string]string) string {
@@ -2163,6 +2194,10 @@ func compileElement(elt *goxml.Element, expandText bool, namespaces map[string]s
 		if err != nil {
 			return nil, fmt.Errorf("XSLT: error parsing namespace AVT in xsl:element: %w", err)
 		}
+	}
+	// inherit-namespaces is validated but not yet honoured.
+	if _, err := booleanAttr(elt, "xsl:element", "inherit-namespaces", true); err != nil {
+		return nil, err
 	}
 	children, err := compileChildren(elt, expandText, namespaces)
 	if err != nil {
