@@ -2402,11 +2402,17 @@ func (c asciiCaseOrderCollation) Compare(a, b string) int {
 	return len(ra) - len(rb)
 }
 
-func (c asciiCaseOrderCollation) Equal(a, b string) bool       { return c.Compare(a, b) == 0 }
-func (c asciiCaseOrderCollation) Contains(s, sub string) bool  { return strings.Contains(strings.ToLower(s), strings.ToLower(sub)) }
-func (c asciiCaseOrderCollation) StartsWith(s, p string) bool  { return strings.HasPrefix(strings.ToLower(s), strings.ToLower(p)) }
-func (c asciiCaseOrderCollation) EndsWith(s, suf string) bool  { return strings.HasSuffix(strings.ToLower(s), strings.ToLower(suf)) }
-func (c asciiCaseOrderCollation) Key(s string) string          { return strings.ToLower(s) }
+func (c asciiCaseOrderCollation) Equal(a, b string) bool { return c.Compare(a, b) == 0 }
+func (c asciiCaseOrderCollation) Contains(s, sub string) bool {
+	return strings.Contains(strings.ToLower(s), strings.ToLower(sub))
+}
+func (c asciiCaseOrderCollation) StartsWith(s, p string) bool {
+	return strings.HasPrefix(strings.ToLower(s), strings.ToLower(p))
+}
+func (c asciiCaseOrderCollation) EndsWith(s, suf string) bool {
+	return strings.HasSuffix(strings.ToLower(s), strings.ToLower(suf))
+}
+func (c asciiCaseOrderCollation) Key(s string) string { return strings.ToLower(s) }
 func (c asciiCaseOrderCollation) SubstringBefore(s, sub string) string {
 	if sub == "" {
 		return ""

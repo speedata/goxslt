@@ -832,9 +832,9 @@ type w3cEnvRef struct {
 }
 
 type w3cTest struct {
-	Stylesheets     []w3cStylesheet    `xml:"http://www.w3.org/2012/10/xslt-test-catalog stylesheet"`
-	Params          []w3cParam         `xml:"http://www.w3.org/2012/10/xslt-test-catalog param"`
-	InitialTemplate *w3cInitTemplate   `xml:"http://www.w3.org/2012/10/xslt-test-catalog initial-template"`
+	Stylesheets     []w3cStylesheet  `xml:"http://www.w3.org/2012/10/xslt-test-catalog stylesheet"`
+	Params          []w3cParam       `xml:"http://www.w3.org/2012/10/xslt-test-catalog param"`
+	InitialTemplate *w3cInitTemplate `xml:"http://www.w3.org/2012/10/xslt-test-catalog initial-template"`
 }
 
 type w3cInitTemplate struct {
@@ -851,12 +851,12 @@ type w3cStylesheet struct {
 }
 
 type w3cResult struct {
-	AssertXML          []w3cAssertXML        `xml:"http://www.w3.org/2012/10/xslt-test-catalog assert-xml"`
-	Assert             []w3cAssert           `xml:"http://www.w3.org/2012/10/xslt-test-catalog assert"`
-	Error              []w3cError            `xml:"http://www.w3.org/2012/10/xslt-test-catalog error"`
-	AllOf              *w3cAllOf             `xml:"http://www.w3.org/2012/10/xslt-test-catalog all-of"`
-	AnyOf              *w3cAnyOf             `xml:"http://www.w3.org/2012/10/xslt-test-catalog any-of"`
-	AssertStringValue  []w3cAssertString     `xml:"http://www.w3.org/2012/10/xslt-test-catalog assert-string-value"`
+	AssertXML          []w3cAssertXML          `xml:"http://www.w3.org/2012/10/xslt-test-catalog assert-xml"`
+	Assert             []w3cAssert             `xml:"http://www.w3.org/2012/10/xslt-test-catalog assert"`
+	Error              []w3cError              `xml:"http://www.w3.org/2012/10/xslt-test-catalog error"`
+	AllOf              *w3cAllOf               `xml:"http://www.w3.org/2012/10/xslt-test-catalog all-of"`
+	AnyOf              *w3cAnyOf               `xml:"http://www.w3.org/2012/10/xslt-test-catalog any-of"`
+	AssertStringValue  []w3cAssertString       `xml:"http://www.w3.org/2012/10/xslt-test-catalog assert-string-value"`
 	SerializationMatch []w3cSerializationMatch `xml:"http://www.w3.org/2012/10/xslt-test-catalog serialization-matches"`
 }
 
@@ -874,8 +874,8 @@ type w3cError struct {
 }
 
 type w3cAssertString struct {
-	Value      string `xml:",chardata"`
-	Normalize  string `xml:"normalize-space,attr"`
+	Value     string `xml:",chardata"`
+	Normalize string `xml:"normalize-space,attr"`
 }
 
 type w3cSerializationMatch struct {
@@ -884,18 +884,18 @@ type w3cSerializationMatch struct {
 }
 
 type w3cAllOf struct {
-	AssertXML         []w3cAssertXML        `xml:"http://www.w3.org/2012/10/xslt-test-catalog assert-xml"`
-	Assert            []w3cAssert           `xml:"http://www.w3.org/2012/10/xslt-test-catalog assert"`
-	AnyOf             []w3cAnyOf            `xml:"http://www.w3.org/2012/10/xslt-test-catalog any-of"`
-	AssertStringValue []w3cAssertString     `xml:"http://www.w3.org/2012/10/xslt-test-catalog assert-string-value"`
+	AssertXML          []w3cAssertXML          `xml:"http://www.w3.org/2012/10/xslt-test-catalog assert-xml"`
+	Assert             []w3cAssert             `xml:"http://www.w3.org/2012/10/xslt-test-catalog assert"`
+	AnyOf              []w3cAnyOf              `xml:"http://www.w3.org/2012/10/xslt-test-catalog any-of"`
+	AssertStringValue  []w3cAssertString       `xml:"http://www.w3.org/2012/10/xslt-test-catalog assert-string-value"`
 	SerializationMatch []w3cSerializationMatch `xml:"http://www.w3.org/2012/10/xslt-test-catalog serialization-matches"`
 }
 
 type w3cAnyOf struct {
-	AssertXML          []w3cAssertXML        `xml:"http://www.w3.org/2012/10/xslt-test-catalog assert-xml"`
-	Assert             []w3cAssert           `xml:"http://www.w3.org/2012/10/xslt-test-catalog assert"`
-	Error              []w3cError            `xml:"http://www.w3.org/2012/10/xslt-test-catalog error"`
-	AssertStringValue  []w3cAssertString     `xml:"http://www.w3.org/2012/10/xslt-test-catalog assert-string-value"`
+	AssertXML          []w3cAssertXML          `xml:"http://www.w3.org/2012/10/xslt-test-catalog assert-xml"`
+	Assert             []w3cAssert             `xml:"http://www.w3.org/2012/10/xslt-test-catalog assert"`
+	Error              []w3cError              `xml:"http://www.w3.org/2012/10/xslt-test-catalog error"`
+	AssertStringValue  []w3cAssertString       `xml:"http://www.w3.org/2012/10/xslt-test-catalog assert-string-value"`
 	SerializationMatch []w3cSerializationMatch `xml:"http://www.w3.org/2012/10/xslt-test-catalog serialization-matches"`
 }
 

@@ -158,14 +158,14 @@ type XSLSequence struct {
 
 // SortKey defines a sort criterion for xsl:sort.
 type SortKey struct {
-	Select          string // XPath expression; default "."
-	Order           AVT    // "ascending" (default) or "descending"
-	DataType        AVT    // "text" (default) or "number"
-	DataTypeExplicit bool  // true if data-type was explicitly set in the stylesheet
-	Lang            string // language tag for collation (e.g. "en", "de")
-	CaseOrder       AVT    // "upper-first" or "lower-first"
-	Stable          string // "yes" or "no"
-	Collation       string // collation URI
+	Select           string // XPath expression; default "."
+	Order            AVT    // "ascending" (default) or "descending"
+	DataType         AVT    // "text" (default) or "number"
+	DataTypeExplicit bool   // true if data-type was explicitly set in the stylesheet
+	Lang             string // language tag for collation (e.g. "en", "de")
+	CaseOrder        AVT    // "upper-first" or "lower-first"
+	Stable           string // "yes" or "no"
+	Collation        string // collation URI
 }
 
 // XSLPerformSort sorts a sequence and writes it to the result tree.
