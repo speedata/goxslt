@@ -215,7 +215,7 @@ func init() {
 					ns = uri
 				}
 			}
-			available := goxpath.FunctionExists(ns, local)
+			available := ctx.FunctionExists(ns, local)
 			return goxpath.Sequence{available}, nil
 		},
 	})
@@ -446,7 +446,7 @@ func TransformWithOptions(ss *Stylesheet, sourceDoc *goxml.XMLDocument, opts Tra
 
 	// Register stylesheet functions with the XPath evaluator.
 	for _, fdef := range ss.Functions {
-		goxpath.RegisterFunction(&goxpath.Function{
+		tc.XPath.Ctx.RegisterFunction(&goxpath.Function{
 			Name:      fdef.LocalName,
 			Namespace: fdef.Namespace,
 			MinArg:    len(fdef.Params),
@@ -2847,7 +2847,7 @@ func (tc *TransformContext) loadDocument(uri string) (*goxml.XMLDocument, error)
 
 // registerKeyFunction registers the key() XPath function for this transformation.
 func (tc *TransformContext) registerKeyFunction(ss *Stylesheet) {
-	goxpath.RegisterFunction(&goxpath.Function{
+	tc.XPath.Ctx.RegisterFunction(&goxpath.Function{
 		Name:      "key",
 		Namespace: "http://www.w3.org/2005/xpath-functions",
 		MinArg:    2,
@@ -2925,7 +2925,7 @@ func (tc *TransformContext) registerKeyFunction(ss *Stylesheet) {
 
 // registerDocumentFunction registers the document() XPath function.
 func (tc *TransformContext) registerDocumentFunction() {
-	goxpath.RegisterFunction(&goxpath.Function{
+	tc.XPath.Ctx.RegisterFunction(&goxpath.Function{
 		Name:      "document",
 		Namespace: nsFN,
 		MinArg:    1,
@@ -2952,7 +2952,7 @@ func (tc *TransformContext) registerDocumentFunction() {
 // id(value) returns elements with a matching xml:id attribute in the context document.
 // id(value, node) returns elements in the document containing node.
 func (tc *TransformContext) registerIDFunction() {
-	goxpath.RegisterFunction(&goxpath.Function{
+	tc.XPath.Ctx.RegisterFunction(&goxpath.Function{
 		Name:      "id",
 		Namespace: nsFN,
 		MinArg:    1,
@@ -3022,7 +3022,7 @@ func walkNodes(node goxml.XMLNode, fn func(goxml.XMLNode)) {
 func (tc *TransformContext) registerUnparsedTextFunction() {
 	basePath := tc.Stylesheet.BasePath
 
-	goxpath.RegisterFunction(&goxpath.Function{
+	tc.XPath.Ctx.RegisterFunction(&goxpath.Function{
 		Name:      "unparsed-text",
 		Namespace: nsFN,
 		MinArg:    1,
@@ -3062,7 +3062,7 @@ func (tc *TransformContext) registerUnparsedTextFunction() {
 		},
 	})
 
-	goxpath.RegisterFunction(&goxpath.Function{
+	tc.XPath.Ctx.RegisterFunction(&goxpath.Function{
 		Name:      "unparsed-text-available",
 		Namespace: nsFN,
 		MinArg:    1,
